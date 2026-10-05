@@ -52,3 +52,24 @@ def test_accepts_other_formats():
     for Y in (X.tocsc(), X.toarray(), sp.csr_array(X)):
         res = metagene.nmf(Y, 3, max_iter=5, seed=0)
         assert res.W.shape == (50, 3)
+
+
+def reference_mu(X, W, H, iters, eps=1e-6):
+    """Dense float64 alternating KL multiplicative updates (W then H), clamping values at eps."""
+    X = X.toarray().astype(np.float64)
+    W, H = W.astype(np.float64), H.astype(np.float64)
+    for _ in range(iters):
+        W = np.maximum(W * ((X / (W @ H)) @ H.T) / H.sum(1), eps)
+        H = np.maximum(H * (W.T @ (X / (W @ H))) / W.sum(0)[:, None], eps)
+    return W, H
+
+
+def test_matches_reference_mu():
+    X = random_counts()
+    rng = np.random.default_rng(3)
+    W0 = rng.random((300, 4)).astype(np.float32)
+    H0 = rng.random((4, 100)).astype(np.float32)
+    res = metagene.nmf(X, 4, max_iter=30, tol=-np.inf, eval_every=0, W0=W0, H0=H0)
+    Wr, Hr = reference_mu(X, W0, H0, 30)
+    np.testing.assert_allclose(res.W, Wr, rtol=1e-3, atol=1e-5)
+    np.testing.assert_allclose(res.H, Hr, rtol=1e-3, atol=1e-5)
