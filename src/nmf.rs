@@ -1,7 +1,7 @@
 use ndarray::{Array1, Array2, Axis, Zip, s};
 use rayon;
 use std::{
-    ops::{AddAssign, MulAssign},
+    ops::AddAssign,
     sync::Mutex,
 };
 
@@ -99,33 +99,30 @@ fn fused_mu(
                     });
             });
 
-            // TODO: I can just do the update here
-            // for each k
-            Zip::from(&mut tl.ρw_i)
-                .and(&h_col_sum)
-                .for_each(|ρw_ik, h_col_sum_k| {
-                    *ρw_ik = (*ρw_ik / h_col_sum_k).max(EPS);
-                });
-
             // multiplicative update of w_i
-            w_i.mul_assign(&tl.ρw_i);
+            // for each k
+            Zip::from(&mut w_i)
+                .and(&tl.ρw_i)
+                .and(&h_col_sum)
+                .for_each(|w_ik, ρw_ik, h_col_sum_k| {
+                    *w_ik = (*w_ik * ρw_ik / h_col_sum_k).max(EPS);
+                });
 
             // for each j (second pass to accumulate updates to ρh)
-            Zip::from(indices_row)
-                .and(data_row)
-                .and(tl.ρht.rows_mut())
-                .for_each(|&j, &x_ij, ρht_j| {
-                    let j = j as usize;
-                    let u_ij = w_i.dot(&ht.row(j));
+            Zip::from(indices_row).and(data_row).for_each(|&j, &x_ij| {
+                let j = j as usize;
+                let u_ij = w_i.dot(&ht.row(j));
 
-                    // for each k
-                    Zip::from(ρht_j).and(&w_i).for_each(|ρh_jk, &w_ik| {
+                // for each k
+                Zip::from(tl.ρht.row_mut(j))
+                    .and(&w_i)
+                    .for_each(|ρh_jk, &w_ik| {
                         *ρh_jk += w_ik * x_ij / u_ij;
                     });
-                });
+            });
         });
 
-    let w_row_sum = ht.sum_axis(Axis(0));
+    let w_col_sum = w.sum_axis(Axis(0));
 
     // accumulate everything into the first thread's ρht matrix
     let mut slot0 = work.slots.first().unwrap().lock().unwrap();
@@ -142,9 +139,9 @@ fn fused_mu(
             // for each k
             Zip::from(ht_j)
                 .and(ρht_j)
-                .and(&w_row_sum)
-                .for_each(|h_kj, ρh_kj, w_row_sum_k| {
-                    *h_kj *= (ρh_kj / w_row_sum_k).max(EPS);
+                .and(&w_col_sum)
+                .for_each(|h_kj, ρh_kj, w_col_sum_k| {
+                    *h_kj = (*h_kj * ρh_kj / w_col_sum_k).max(EPS);
                 });
         })
 }
