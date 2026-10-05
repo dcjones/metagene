@@ -1,6 +1,54 @@
+import numpy as np
 import pytest
+import scipy.sparse as sp
+
 import metagene
 
 
-def test_sum_as_string():
-    assert metagene.sum_as_string(1, 1) == "2"
+def random_counts(m=300, n=100, k=4, seed=0):
+    rng = np.random.default_rng(seed)
+    W = rng.gamma(0.5, 1.0, (m, k))
+    H = rng.gamma(0.3, 1.0, (k, n))
+    return sp.csr_matrix(rng.poisson(W @ H).astype(np.float32))
+
+
+def kl(X, W, H):
+    X = X.toarray().astype(np.float64)
+    U = W.astype(np.float64) @ H.astype(np.float64)
+    nz = X > 0
+    return np.sum(X[nz] * np.log(X[nz] / U[nz])) - X.sum() + U.sum()
+
+
+def test_shapes_and_nonnegativity():
+    X = random_counts()
+    res = metagene.nmf(X, 4, max_iter=50, seed=1)
+    assert res.W.shape == (300, 4)
+    assert res.H.shape == (4, 100)
+    assert (res.W > 0).all() and (res.H > 0).all()
+
+
+def test_objective_decreases_and_matches_numpy():
+    X = random_counts()
+    res = metagene.nmf(X, 4, max_iter=100, tol=-np.inf, eval_every=1, seed=1)
+    losses = [l for _, l in res.loss]
+    assert res.n_iter == 100
+    assert all(b <= a * (1 + 1e-6) for a, b in zip(losses, losses[1:]))
+    assert losses[-1] == pytest.approx(kl(X, res.W, res.H), rel=1e-4)
+
+
+def test_given_init_is_deterministic():
+    X = random_counts()
+    rng = np.random.default_rng(2)
+    W0 = rng.random((300, 4)).astype(np.float32)
+    H0 = rng.random((4, 100)).astype(np.float32)
+    a = metagene.nmf(X, 4, max_iter=20, W0=W0, H0=H0, n_threads=1)
+    b = metagene.nmf(X, 4, max_iter=20, W0=W0, H0=H0, n_threads=1)
+    np.testing.assert_array_equal(a.W, b.W)
+    np.testing.assert_array_equal(a.H, b.H)
+
+
+def test_accepts_other_formats():
+    X = random_counts(m=50, n=30)
+    for Y in (X.tocsc(), X.toarray(), sp.csr_array(X)):
+        res = metagene.nmf(Y, 3, max_iter=5, seed=0)
+        assert res.W.shape == (50, 3)
