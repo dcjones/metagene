@@ -1,7 +1,6 @@
 use pyo3::prelude::*;
 
 mod nmf;
-use nmf::nmf;
 
 /// A Python module implemented in Rust.
 #[pymodule]
