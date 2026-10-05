@@ -1,0 +1,15 @@
+[package]
+name = "metagene"
+version = "0.1.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "metagene"
+crate-type = ["cdylib"]
+
+[dependencies]
+ndarray = { version = "0.17.2", features = ["rayon"] }
+numpy = "0.29.0"
+pyo3 = "0.29.0"
+rayon = "1.12.0"
