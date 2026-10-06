@@ -56,13 +56,14 @@ def test_accepts_other_formats():
         assert res.W.shape == (50, 3)
 
 
-def reference_mu(X, W, H, iters, eps=1e-6):
+def reference_mu(X, W, H, iters, eps=1e-6, fit_H=True):
     """Dense float64 alternating KL multiplicative updates (W then H), clamping values at eps."""
     X = X.toarray().astype(np.float64)
     W, H = W.astype(np.float64), H.astype(np.float64)
     for _ in range(iters):
         W = np.maximum(W * ((X / (W @ H)) @ H.T) / H.sum(1), eps)
-        H = np.maximum(H * (W.T @ (X / (W @ H))) / W.sum(0)[:, None], eps)
+        if fit_H:
+            H = np.maximum(H * (W.T @ (X / (W @ H))) / W.sum(0)[:, None], eps)
     return W, H
 
 
@@ -121,3 +122,44 @@ def test_bmme_loss_is_evaluated_at_iterates(restart):
     final = res.loss[-1][2]
     assert final == pytest.approx(kl(X, res.W, res.H), rel=1e-4)
     assert final < 0.5 * res.loss[0][2]
+
+
+def test_fixed_H_matches_reference():
+    X = random_counts()
+    rng = np.random.default_rng(4)
+    W0 = rng.random((300, 4)).astype(np.float32)
+    H0 = rng.random((4, 100)).astype(np.float32)
+    res = metagene.nmf(X, 4, method="mu", fit_H=False, max_iter=20,
+                       tol=-np.inf, eval_every=1, W0=W0, H0=H0)
+    Wr, Hr = reference_mu(X, W0, H0, 20, fit_H=False)
+    np.testing.assert_allclose(res.W, Wr, rtol=1e-3, atol=1e-5)
+    np.testing.assert_allclose(res.H, Hr, rtol=1e-3, atol=1e-5)
+    np.testing.assert_array_equal(res.H, H0)
+    losses = [l for _, _, l in res.loss]
+    assert all(b <= a * (1 + 1e-6) for a, b in zip(losses, losses[1:]))
+
+
+def test_fixed_H_without_W0():
+    X = random_counts()
+    fit = metagene.nmf(X, 4, max_iter=100, seed=0)
+    proj = metagene.nmf(X, 4, H0=fit.H, fit_H=False, max_iter=200, tol=0)
+    np.testing.assert_array_equal(proj.H, fit.H)
+    assert proj.loss[-1][2] <= fit.loss[-1][2] * (1 + 1e-3)
+
+
+def test_warm_start():
+    X = random_counts(m=600)
+    res = metagene.nmf(X, 4, warm_start=True, warm_start_fraction=0.2, max_iter=50, tol=-np.inf,
+                       eval_every=1, seed=0)
+    assert res.warm_start_time > 0
+    assert res.loss[0][1] >= res.warm_start_time
+    assert res.loss[-1][2] == pytest.approx(kl(X, res.W, res.H), rel=1e-4)
+    cold = metagene.nmf(X, 4, warm_start=False, max_iter=50, tol=-np.inf, eval_every=1, seed=0)
+    assert res.loss[0][2] < cold.loss[0][2]
+
+
+def test_warm_start_auto():
+    X = random_counts()
+    assert metagene.nmf(X, 4, max_iter=5, seed=0).warm_start_time == 0
+    with pytest.raises(ValueError):
+        metagene.nmf(X, 4, warm_start=True, warm_start_fraction=0.001, max_iter=5, seed=0)

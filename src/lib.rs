@@ -15,7 +15,7 @@ mod metagene {
     /// `w` [m, k] and `ht` [n, k]. Returns (w, ht, loss, n_iter), where loss is a list of
     /// (iteration, elapsed seconds, kl) tuples.
     #[pyfunction]
-    #[pyo3(signature = (data, indices, indptr, w, ht, max_iter, tol, eval_every, verbose, n_threads=None, max_time=None, extrapolate=false, restart=false))]
+    #[pyo3(signature = (data, indices, indptr, w, ht, max_iter, tol, eval_every, verbose, n_threads=None, max_time=None, extrapolate=false, restart=false, fit_h=true))]
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn _nmf<'py>(
         py: Python<'py>,
@@ -32,6 +32,7 @@ mod metagene {
         max_time: Option<f64>,
         extrapolate: bool,
         restart: bool,
+        fit_h: bool,
     ) -> PyResult<(
         Bound<'py, PyArray2<f32>>,
         Bound<'py, PyArray2<f32>>,
@@ -70,6 +71,7 @@ mod metagene {
             max_time,
             extrapolate,
             restart,
+            fit_h,
             verbose,
         };
 

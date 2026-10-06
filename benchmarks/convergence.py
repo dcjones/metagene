@@ -20,6 +20,7 @@ Requires the `bench` extra (h5py, zarr, matplotlib).
 import argparse
 import csv
 import json
+import re
 import sys
 import time
 from collections import defaultdict
@@ -36,6 +37,7 @@ from datasets import load  # noqa: E402
 # a metagene.NMFResult whose loss records are (iteration, elapsed seconds, kl). Any work a method
 # does before calling metagene.nmf (e.g. fitting a subsample) must be included in those times.
 def _metagene(**kw):
+    kw.setdefault("warm_start", False)
     return lambda X, k, W0, H0, max_iter, max_time, n_threads, eval_every: metagene.nmf(
         X, k, W0=W0, H0=H0, max_iter=max_iter, max_time=max_time,
         tol=-np.inf, eval_every=eval_every, n_threads=n_threads, **kw,
@@ -46,9 +48,27 @@ METHODS = {
     "mu": _metagene(method="mu"),
     "bmme": _metagene(method="bmme"),
     "bmme-restart": _metagene(method="bmme", restart=True),
+    "bmme-warm": _metagene(method="bmme", warm_start=True, seed=0),
 }
 
 REF = "ref"
+
+# Warm start variants can be named as bmme-warm-f<fraction>-i<subsample iters>-p<W-only passes>.
+WARM_PATTERN = re.compile(r"bmme-warm-f([0-9.]+)-i(\d+)-p(\d+)")
+
+
+def get_method(name):
+    if name in METHODS:
+        return METHODS[name]
+    if mt := WARM_PATTERN.fullmatch(name):
+        frac, iters, passes = float(mt[1]), int(mt[2]), int(mt[3])
+        return _metagene(method="bmme", warm_start=True, seed=0, warm_start_fraction=frac,
+                         warm_start_iter=iters, warm_start_w_passes=passes)
+    raise ValueError(f"unknown method {name!r}")
+
+
+def method_order(name):
+    return (list(METHODS).index(name), "") if name in METHODS else (len(METHODS), name)
 
 THRESHOLDS = (1e-2, 1e-3, 1e-4)
 
@@ -93,12 +113,12 @@ def cmd_run(args):
     for seed in args.seeds:
         W0, H0 = init_factors(X, args.k, seed)
         if args.ref_iters:
-            res = METHODS[args.ref_method](
+            res = get_method(args.ref_method)(
                 X, args.k, W0, H0, args.ref_iters, None, args.threads, max(args.ref_iters // 1000, 1)
             )
             save(REF, seed, res)
         for name in args.methods:
-            res = METHODS[name](X, args.k, W0, H0, args.max_iter, args.max_time, args.threads, args.eval_every)
+            res = get_method(name)(X, args.k, W0, H0, args.max_iter, args.max_time, args.threads, args.eval_every)
             save(name, seed, res)
 
     report(out, args.plot)
@@ -140,7 +160,7 @@ def report(out, plot=False):
                     print(f"warning: seed {seed} {m} beats the reference by "
                           f"{(ref_kl - kl.min()) / ref_kl:.1e}; use a longer --ref-iters")
         traces[seed] = {m: tr for m, tr in runs.items() if m != REF}
-    methods = sorted({m for runs in traces.values() for m in runs}, key=list(METHODS).index)
+    methods = sorted({m for runs in traces.values() for m in runs}, key=method_order)
 
     # median over seeds of time / iterations to reach each relative gap to the best objective
     header = "".join(f"  {'≤' + format(r, '.0e'):>17}" for r in THRESHOLDS)
@@ -202,7 +222,8 @@ def main():
     r.add_argument("--ncells", type=int, help="use only the first NCELLS cells")
     r.add_argument("--k", type=int, default=100)
     r.add_argument("--seeds", type=int, nargs="+", default=[0])
-    r.add_argument("--methods", nargs="*", default=list(METHODS), choices=list(METHODS))
+    r.add_argument("--methods", nargs="*", default=list(METHODS),
+                   help=f"any of {list(METHODS)}, or bmme-warm-f<frac>-i<iters>-p<passes>")
     r.add_argument("--max-iter", type=int, default=1000)
     r.add_argument("--max-time", type=float, help="per-run time limit in seconds")
     r.add_argument("--eval-every", type=int, default=1,
@@ -210,7 +231,7 @@ def main():
                         "for methods that can't evaluate it for free it still costs wall time)")
     r.add_argument("--threads", type=int)
     r.add_argument("--ref-iters", type=int, help="also run a reference of this many iterations per seed")
-    r.add_argument("--ref-method", default="mu", choices=list(METHODS))
+    r.add_argument("--ref-method", default="mu")
     r.add_argument("--out", required=True)
     r.add_argument("--plot", action="store_true")
     r.set_defaults(func=cmd_run)
@@ -221,6 +242,8 @@ def main():
     s.set_defaults(func=lambda a: report(a.out, a.plot))
 
     args = p.parse_args()
+    for name in getattr(args, "methods", []) + [getattr(args, "ref_method", "mu")]:
+        get_method(name)
     args.func(args)
 
 

@@ -14,4 +14,5 @@ def _nmf(
     max_time: float | None = None,
     extrapolate: bool = False,
     restart: bool = False,
+    fit_h: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, list[tuple[int, float, float]], int]: ...

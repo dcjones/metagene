@@ -33,6 +33,9 @@ pub struct NMFOptions {
     // higher than the previous evaluation.
     pub restart: bool,
 
+    // Update H. If false, H is held fixed and only W is fit.
+    pub fit_h: bool,
+
     pub verbose: bool,
 }
 
@@ -45,6 +48,7 @@ impl Default for NMFOptions {
             max_time: None,
             extrapolate: true,
             restart: false,
+            fit_h: true,
             verbose: false,
         }
     }
@@ -94,12 +98,13 @@ pub fn nmf(
     let elapsed = |eval_time: Duration| (start.elapsed() - eval_time).as_secs_f64();
 
     let block_rows = (H_PASS_BLOCK_BYTES / (k * size_of::<f32>())).max(1);
-    let csc = BlockedCSC::from_csr(x, n, block_rows);
-    let mut ρht = Array2::<f32>::zeros((n, k));
+    // only needed to update H
+    let csc = opts.fit_h.then(|| BlockedCSC::from_csr(x, n, block_rows));
+    let mut ρht = Array2::<f32>::zeros((if opts.fit_h { n } else { 0 }, k));
 
     // previous iterates, for extrapolation
     let mut w_prev = opts.extrapolate.then(|| w.clone());
-    let mut ht_prev = opts.extrapolate.then(|| ht.clone());
+    let mut ht_prev = (opts.extrapolate && opts.fit_h).then(|| ht.clone());
     let mut t_nesterov = 1_f64;
 
     let mut loss = Vec::new();
@@ -141,10 +146,12 @@ pub fn nmf(
             extrapolate(&mut w, w_prev, β);
         }
         let l_fused = update_w(x, &mut w, &ht, fused_eval);
-        if let Some(ht_prev) = &mut ht_prev {
-            extrapolate(&mut ht, ht_prev, β);
+        if opts.fit_h {
+            if let Some(ht_prev) = &mut ht_prev {
+                extrapolate(&mut ht, ht_prev, β);
+            }
+            update_h(csc.as_ref().unwrap(), &mut ρht, &w, &mut ht);
         }
-        update_h(&csc, &mut ρht, &w, &mut ht);
         n_iter = iter + 1;
 
         if let Some(l) = l.or(l_fused) {
@@ -465,6 +472,7 @@ mod tests {
             max_time: None,
             extrapolate: false,
             restart: false,
+            fit_h: true,
             verbose: false,
         };
         let x = CSR {
