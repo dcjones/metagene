@@ -1,6 +1,11 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip, s};
 use rayon::prelude::*;
 
+// Maximum number of rows (or columns) per rayon task. Per-row work varies a lot (cells differ in
+// depth, genes in detection rate) and inputs are often ordered in ways that cluster heavy rows, so
+// without this rayon's default ~1 chunk per thread can leave most threads idle.
+const PAR_GRAIN: usize = 4;
+
 pub struct NMFOptions {
     // maximum number of iterations
     pub max_iter: usize,
@@ -113,6 +118,7 @@ pub fn kl_divergence(
 ) -> f64 {
     let nz_part: f64 = (0..w.nrows())
         .into_par_iter()
+        .with_max_len(PAR_GRAIN)
         .map(|i| {
             let idx_from = x.indptr[i] as usize;
             let idx_to = x.indptr[i + 1] as usize;
@@ -217,6 +223,7 @@ fn mu_step(
     let nz_loss: f64 = w
         .axis_iter_mut(Axis(0))
         .into_par_iter()
+        .with_max_len(PAR_GRAIN)
         .enumerate()
         .map_init(
             || Array1::<f32>::zeros(k),
@@ -253,6 +260,7 @@ fn mu_step(
     let w_ro = &*w;
     ht.axis_iter_mut(Axis(0))
         .into_par_iter()
+        .with_max_len(PAR_GRAIN)
         .enumerate()
         .for_each_init(
             || Array1::<f32>::zeros(k),
