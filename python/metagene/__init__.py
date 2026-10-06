@@ -14,7 +14,7 @@ __all__ = ["nmf", "NMFResult"]
 class NMFResult:
     W: np.ndarray  # [m, k]
     H: np.ndarray  # [k, n]
-    loss: list = field(default_factory=list)  # (iteration, kl) pairs
+    loss: list = field(default_factory=list)  # (iteration, elapsed seconds, kl) tuples
     n_iter: int = 0
 
 
@@ -42,6 +42,7 @@ def nmf(
     k: int,
     *,
     max_iter: int = 200,
+    max_time: float | None = None,
     tol: float = 1e-4,
     eval_every: int = 10,
     W0: np.ndarray | None = None,
@@ -60,6 +61,8 @@ def nmf(
         Number of factors.
     max_iter : int
         Maximum number of iterations.
+    max_time : float, optional
+        Stop after this many seconds, not counting time spent only on evaluating the objective.
     tol : float
         Stop when the relative decrease in KL divergence between evaluations is below this.
     eval_every : int
@@ -99,6 +102,6 @@ def nmf(
     ht = np.ascontiguousarray(H0.T, dtype=np.float32)
 
     w, ht, loss, n_iter = _nmf(
-        data, indices, indptr, w, ht, max_iter, tol, eval_every, verbose, n_threads
+        data, indices, indptr, w, ht, max_iter, tol, eval_every, verbose, n_threads, max_time
     )
     return NMFResult(W=w, H=ht.T, loss=loss, n_iter=n_iter)

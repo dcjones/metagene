@@ -30,7 +30,9 @@ def test_shapes_and_nonnegativity():
 def test_objective_decreases_and_matches_numpy():
     X = random_counts()
     res = metagene.nmf(X, 4, max_iter=100, tol=-np.inf, eval_every=1, seed=1)
-    losses = [l for _, l in res.loss]
+    losses = [l for _, _, l in res.loss]
+    times = [t for _, t, _ in res.loss]
+    assert all(b >= a for a, b in zip(times, times[1:]))
     assert res.n_iter == 100
     assert all(b <= a * (1 + 1e-6) for a, b in zip(losses, losses[1:]))
     assert losses[-1] == pytest.approx(kl(X, res.W, res.H), rel=1e-4)
@@ -73,3 +75,10 @@ def test_matches_reference_mu():
     Wr, Hr = reference_mu(X, W0, H0, 30)
     np.testing.assert_allclose(res.W, Wr, rtol=1e-3, atol=1e-5)
     np.testing.assert_allclose(res.H, Hr, rtol=1e-3, atol=1e-5)
+
+
+def test_max_time():
+    X = random_counts()
+    res = metagene.nmf(X, 4, max_iter=10**9, max_time=0.05, tol=-np.inf, seed=0)
+    assert res.n_iter < 10**9
+    assert 0.05 <= res.loss[-1][1] < 1.0

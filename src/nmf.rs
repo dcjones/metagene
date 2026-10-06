@@ -1,6 +1,7 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip, s};
 use rayon::prelude::*;
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 // Maximum number of rows (or columns) per rayon task. Per-row work varies a lot (cells differ in
 // depth, genes in detection rate) and inputs are often ordered in ways that cluster heavy rows, so
@@ -22,6 +23,9 @@ pub struct NMFOptions {
     // evaluate the objective every this many iterations (0 to never evaluate)
     pub eval_every: usize,
 
+    // stop after this many seconds (excluding time spent evaluating the objective separately)
+    pub max_time: Option<f64>,
+
     pub verbose: bool,
 }
 
@@ -31,6 +35,7 @@ impl Default for NMFOptions {
             max_iter: 200,
             tol: 1e-4,
             eval_every: 10,
+            max_time: None,
             verbose: false,
         }
     }
@@ -40,8 +45,8 @@ pub struct NMFResult {
     pub w: Array2<f32>,  // [m, k]
     pub ht: Array2<f32>, // [n, k]
 
-    // (iteration, objective) pairs
-    pub loss: Vec<(usize, f64)>,
+    // (iteration, elapsed seconds, objective)
+    pub loss: Vec<(usize, f64, f64)>,
 
     pub n_iter: usize,
 }
@@ -74,6 +79,11 @@ pub fn nmf(
     assert_eq!(x.data.len(), x.indices.len());
     assert_eq!(x.indptr[m] as usize, x.data.len());
 
+    let start = Instant::now();
+    // time spent evaluating the objective outside of the update passes, excluded from timings
+    let mut eval_time = Duration::ZERO;
+    let elapsed = |eval_time: Duration| (start.elapsed() - eval_time).as_secs_f64();
+
     let block_rows = (H_PASS_BLOCK_BYTES / (k * size_of::<f32>())).max(1);
     let csc = BlockedCSC::from_csr(x, n, block_rows);
     let mut ρht = Array2::<f32>::zeros((n, k));
@@ -81,10 +91,10 @@ pub fn nmf(
     let mut prev_loss = f64::INFINITY;
     let mut n_iter = 0;
 
-    let mut record = |iter: usize, l: f64| {
-        loss.push((iter, l));
+    let mut record = |iter: usize, t: f64, l: f64| {
+        loss.push((iter, t, l));
         if opts.verbose {
-            eprintln!("iter {iter}: kl = {l:.6e}");
+            eprintln!("iter {iter} ({t:.2}s): kl = {l:.6e}");
         }
     };
 
@@ -95,16 +105,29 @@ pub fn nmf(
         n_iter = iter + 1;
 
         if let Some(l) = l {
-            record(iter, l);
+            // Fused into the step, so the state it describes was reached before the step began.
+            // Timing at the end of the step slightly overstates the time, by under one step.
+            record(iter, elapsed(eval_time), l);
             if (prev_loss - l) / l.abs().max(f64::MIN_POSITIVE) < opts.tol {
                 break;
             }
             prev_loss = l;
         }
+
+        if opts
+            .max_time
+            .is_some_and(|max_time| elapsed(eval_time) >= max_time)
+        {
+            break;
+        }
     }
 
     if opts.eval_every > 0 {
-        record(n_iter, kl_divergence(x, w.view(), ht.view()));
+        let t = elapsed(eval_time);
+        let t0 = Instant::now();
+        let l = kl_divergence(x, w.view(), ht.view());
+        eval_time += t0.elapsed();
+        record(n_iter, t, l);
     }
 
     NMFResult {
@@ -362,6 +385,7 @@ mod tests {
             max_iter: 100,
             tol: f64::NEG_INFINITY,
             eval_every: 1,
+            max_time: None,
             verbose: false,
         };
         let x = CSR {
@@ -374,14 +398,14 @@ mod tests {
         assert_eq!(result.n_iter, opts.max_iter);
         assert_eq!(result.loss.len(), opts.max_iter + 1);
         for pair in result.loss.windows(2) {
-            let (prev, next) = (pair[0].1, pair[1].1);
+            let (prev, next) = (pair[0].2, pair[1].2);
             assert!(next.is_finite());
             assert!(
                 next <= prev * (1.0 + 1e-6),
                 "objective increased: {prev} -> {next}"
             );
         }
-        let (first, last) = (result.loss[0].1, result.loss.last().unwrap().1);
+        let (first, last) = (result.loss[0].2, result.loss.last().unwrap().2);
         assert!(
             last < 0.9 * first,
             "objective barely decreased: {first} -> {last}"

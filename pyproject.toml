@@ -19,6 +19,11 @@ dependencies = [
 tests = [
     "pytest",
 ]
+bench = [
+    "h5py",
+    "zarr",
+    "matplotlib",
+]
 [tool.maturin]
 python-source = "python"
 exclude = [

@@ -11,4 +11,5 @@ def _nmf(
     eval_every: int,
     verbose: bool,
     n_threads: int | None = None,
-) -> tuple[np.ndarray, np.ndarray, list[tuple[int, float]], int]: ...
+    max_time: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[tuple[int, float, float]], int]: ...

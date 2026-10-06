@@ -13,9 +13,9 @@ mod metagene {
     ///
     /// Factorizes the [m, n] CSR matrix (data, indices, indptr) as X ≈ W Hᵀ, starting from
     /// `w` [m, k] and `ht` [n, k]. Returns (w, ht, loss, n_iter), where loss is a list of
-    /// (iteration, kl) pairs.
+    /// (iteration, elapsed seconds, kl) tuples.
     #[pyfunction]
-    #[pyo3(signature = (data, indices, indptr, w, ht, max_iter, tol, eval_every, verbose, n_threads=None))]
+    #[pyo3(signature = (data, indices, indptr, w, ht, max_iter, tol, eval_every, verbose, n_threads=None, max_time=None))]
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn _nmf<'py>(
         py: Python<'py>,
@@ -29,10 +29,11 @@ mod metagene {
         eval_every: usize,
         verbose: bool,
         n_threads: Option<usize>,
+        max_time: Option<f64>,
     ) -> PyResult<(
         Bound<'py, PyArray2<f32>>,
         Bound<'py, PyArray2<f32>>,
-        Vec<(usize, f64)>,
+        Vec<(usize, f64, f64)>,
         usize,
     )> {
         let data = data.as_array();
@@ -64,6 +65,7 @@ mod metagene {
             max_iter,
             tol,
             eval_every,
+            max_time,
             verbose,
         };
 
