@@ -4,7 +4,7 @@ mod nmf;
 
 #[pymodule]
 mod metagene {
-    use crate::nmf::{NMFOptions, nmf};
+    use crate::nmf::{CSR, NMFOptions, nmf};
     use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
     use pyo3::exceptions::PyValueError;
     use pyo3::prelude::*;
@@ -78,7 +78,12 @@ mod metagene {
         };
 
         let result = py.detach(|| {
-            let run = || nmf(data, indices, indptr, w, ht, &opts);
+            let x = CSR {
+                data,
+                indices,
+                indptr,
+            };
+            let run = || nmf(&x, w, ht, &opts);
             match &pool {
                 Some(pool) => pool.install(run),
                 None => run(),

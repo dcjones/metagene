@@ -1,6 +1,5 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip, s};
 use rayon::prelude::*;
-use std::{ops::AddAssign, sync::Mutex};
 
 pub struct NMFOptions {
     // maximum number of iterations
@@ -36,6 +35,13 @@ pub struct NMFResult {
     pub n_iter: usize,
 }
 
+// A CSR matrix borrowing its arrays (e.g. from numpy).
+pub struct CSR<'a> {
+    pub data: ArrayView1<'a, f32>,
+    pub indices: ArrayView1<'a, u32>, // column (gene) indices
+    pub indptr: ArrayView1<'a, u32>,
+}
+
 // An optimized KL-NMF implementation, using extrapolated multiplicative updates, and parallelized across
 // rows (typically, cells).
 //
@@ -43,12 +49,9 @@ pub struct NMFResult {
 //     Minimization with extrapolation and application to β-NMF. SIAM J.
 //     Math. Data Sci., 7, 1292–1314.
 //
-// The [m, n] count matrix is given in CSR form by `data`, `indices`, `indptr`. `w` and `ht` are the
-// initial factors, so that X ≈ W Hᵀ.
+// `x` is the [m, n] count matrix. `w` and `ht` are the initial factors, so that X ≈ W Hᵀ.
 pub fn nmf(
-    data: ArrayView1<f32>,
-    indices: ArrayView1<u32>,
-    indptr: ArrayView1<u32>,
+    x: &CSR,
     mut w: Array2<f32>,  // [m, k]
     mut ht: Array2<f32>, // [n, k]
     opts: &NMFOptions,
@@ -58,32 +61,39 @@ pub fn nmf(
     let (m, k) = w.dim();
     let n = ht.nrows();
     assert_eq!(ht.ncols(), k);
-    assert_eq!(indptr.len(), m + 1);
-    assert_eq!(data.len(), indices.len());
-    assert_eq!(indptr[m] as usize, data.len());
+    assert_eq!(x.indptr.len(), m + 1);
+    assert_eq!(x.data.len(), x.indices.len());
+    assert_eq!(x.indptr[m] as usize, x.data.len());
 
-    let mut work = FusedMUWork::new(rayon::current_num_threads(), n, k);
+    let csc = CSC::from_csr(x, n);
     let mut loss = Vec::new();
     let mut prev_loss = f64::INFINITY;
     let mut n_iter = 0;
 
+    let mut record = |iter: usize, l: f64| {
+        loss.push((iter, l));
+        if opts.verbose {
+            eprintln!("iter {iter}: kl = {l:.6e}");
+        }
+    };
+
     for iter in 0..opts.max_iter {
-        fused_mu(data, indices, indptr, &mut w, &mut ht, &mut work);
+        // The objective is computed during the step, for the state before the step.
+        let eval = opts.eval_every > 0 && iter % opts.eval_every == 0;
+        let l = mu_step(x, &csc, &mut w, &mut ht, eval);
         n_iter = iter + 1;
 
-        let last = n_iter == opts.max_iter;
-        if opts.eval_every > 0 && (n_iter % opts.eval_every == 0 || last) {
-            let l = kl_divergence(data, indices, indptr, w.view(), ht.view());
-            loss.push((n_iter, l));
-            if opts.verbose {
-                eprintln!("iter {n_iter}: kl = {l:.6e}");
-            }
-
+        if let Some(l) = l {
+            record(iter, l);
             if (prev_loss - l) / l.abs().max(f64::MIN_POSITIVE) < opts.tol {
                 break;
             }
             prev_loss = l;
         }
+    }
+
+    if opts.eval_every > 0 {
+        record(n_iter, kl_divergence(x, w.view(), ht.view()));
     }
 
     NMFResult {
@@ -97,23 +107,22 @@ pub fn nmf(
 // Generalized KL divergence D(X || W Hᵀ). Only nonzero entries of X contribute log terms, and
 // Σ_ij u_ij factorizes as Σ_k (Σ_i w_ik)(Σ_j h_jk).
 pub fn kl_divergence(
-    data: ArrayView1<f32>,
-    indices: ArrayView1<u32>,
-    indptr: ArrayView1<u32>,
+    x: &CSR,
     w: ArrayView2<f32>,  // [m, k]
     ht: ArrayView2<f32>, // [n, k]
 ) -> f64 {
     let nz_part: f64 = (0..w.nrows())
         .into_par_iter()
         .map(|i| {
-            let idx_from = indptr[i] as usize;
-            let idx_to = indptr[i + 1] as usize;
+            let idx_from = x.indptr[i] as usize;
+            let idx_to = x.indptr[i + 1] as usize;
             let w_i = w.row(i);
             let mut acc = 0_f64;
-            for (&j, &x_ij) in indices
+            for (&j, &x_ij) in x
+                .indices
                 .slice(s![idx_from..idx_to])
                 .iter()
-                .zip(data.slice(s![idx_from..idx_to]))
+                .zip(x.data.slice(s![idx_from..idx_to]))
             {
                 if x_ij > 0.0 {
                     let x_ij = x_ij as f64;
@@ -125,130 +134,148 @@ pub fn kl_divergence(
         })
         .sum();
 
-    let w_col_sum = w.mapv(|v| v as f64).sum_axis(Axis(0));
-    let h_col_sum = ht.mapv(|v| v as f64).sum_axis(Axis(0));
-
-    nz_part + w_col_sum.dot(&h_col_sum)
+    nz_part + col_sum_f64(w).dot(&col_sum_f64(ht))
 }
 
-struct FusedMUThreadLocal {
-    // re-used on each row/thread to compute updates factors
-    ρw_i: Array1<f32>,
-
-    // accumulated across rows/threads to compute update factors for all of H
-    ρht: Array2<f32>,
+// Column sums accumulated in f64, in parallel over rows.
+fn col_sum_f64(a: ArrayView2<f32>) -> Array1<f64> {
+    let k = a.ncols();
+    a.axis_iter(Axis(0))
+        .into_par_iter()
+        .fold(
+            || Array1::<f64>::zeros(k),
+            |mut acc, row| {
+                Zip::from(&mut acc)
+                    .and(&row)
+                    .for_each(|acc_k, &v| *acc_k += v as f64);
+                acc
+            },
+        )
+        .reduce(|| Array1::<f64>::zeros(k), |a, b| a + b)
 }
 
-struct FusedMUWork {
-    slots: Vec<Mutex<FusedMUThreadLocal>>,
+// Transposed (CSC) copy of the sparsity structure of X, so H can be updated in a column-parallel
+// pass where each thread owns the rows of H it writes.
+struct CSC {
+    data: Vec<f32>,
+    indices: Vec<u32>, // row (cell) indices
+    indptr: Vec<usize>,
 }
 
-impl FusedMUWork {
-    fn new(nthreads: usize, n: usize, k: usize) -> Self {
+impl CSC {
+    fn from_csr(x: &CSR, n: usize) -> Self {
+        let m = x.indptr.len() - 1;
+        let nnz = x.data.len();
+
+        let mut csc_indptr = vec![0_usize; n + 1];
+        for &j in x.indices {
+            csc_indptr[j as usize + 1] += 1;
+        }
+        for j in 0..n {
+            csc_indptr[j + 1] += csc_indptr[j];
+        }
+
+        let mut next = csc_indptr.clone();
+        let mut csc_data = vec![0_f32; nnz];
+        let mut csc_indices = vec![0_u32; nnz];
+        for i in 0..m {
+            for p in x.indptr[i] as usize..x.indptr[i + 1] as usize {
+                let j = x.indices[p] as usize;
+                csc_data[next[j]] = x.data[p];
+                csc_indices[next[j]] = i as u32;
+                next[j] += 1;
+            }
+        }
+
         Self {
-            slots: (0..nthreads)
-                .map(|_| {
-                    Mutex::new(FusedMUThreadLocal {
-                        ρw_i: Array1::zeros(k),
-                        ρht: Array2::zeros((n, k)),
-                    })
-                })
-                .collect(),
+            data: csc_data,
+            indices: csc_indices,
+            indptr: csc_indptr,
         }
     }
 }
 
-// Update both W and U in the same loop using a multiplicative update.
-fn fused_mu(
-    data: ArrayView1<f32>,
-    indices: ArrayView1<u32>,
-    indptr: ArrayView1<u32>,
+// One multiplicative update of W (row-parallel over CSR), followed by one of H using the updated W
+// (column-parallel over CSC). If `compute_loss`, also returns the KL divergence of the state prior
+// to the update, which is nearly free since the W pass already computes u_ij at each nonzero.
+fn mu_step(
+    x: &CSR,
+    csc: &CSC,
     w: &mut Array2<f32>,  // [m, k]
     ht: &mut Array2<f32>, // [n, k]
-    work: &mut FusedMUWork,
-) {
+    compute_loss: bool,
+) -> Option<f64> {
     const EPS: f32 = 1e-6;
+    let k = w.ncols();
 
-    // clear accumulators
-    work.slots.iter().for_each(|slot| {
-        slot.lock().unwrap().ρht.fill(0_f32);
-    });
+    // Σ_ij u_ij term of the objective, from the state prior to the update
+    let u_sum = compute_loss.then(|| col_sum_f64(w.view()).dot(&col_sum_f64(ht.view())));
 
+    // update W
     let h_col_sum = ht.sum_axis(Axis(0));
+    let ht_ro = &*ht;
+    let nz_loss: f64 = w
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .map_init(
+            || Array1::<f32>::zeros(k),
+            |ρw_i, (i, mut w_i)| {
+                ρw_i.fill(0_f32);
+                let mut nz_loss_i = 0_f64;
 
-    // for each i
-    Zip::indexed(indptr.slice(s![..-1]))
-        .and(indptr.slice(s![1..]))
-        .and(w.rows_mut())
-        .par_for_each(|_i, &idx_from, &idx_to, mut w_i| {
-            let thread_id = rayon::current_thread_index().unwrap();
-            let mut tl = work.slots[thread_id].lock().unwrap();
-
-            tl.ρw_i.fill(0_f32);
-
-            let idx_from = idx_from as usize;
-            let idx_to = idx_to as usize;
-
-            let data_row = data.slice(s![idx_from..idx_to]);
-            let indices_row = indices.slice(s![idx_from..idx_to]);
-
-            // for each j
-            Zip::from(indices_row).and(data_row).for_each(|&j, &x_ij| {
-                let j = j as usize;
-                let u_ij = w_i.dot(&ht.row(j));
-
-                // for each k
-                Zip::from(&mut tl.ρw_i)
-                    .and(ht.row(j))
-                    .for_each(|ρw_ik, h_jk| {
-                        *ρw_ik += h_jk * x_ij / u_ij;
-                    });
-            });
-
-            // multiplicative update of w_i
-            // for each k
-            Zip::from(&mut w_i).and(&tl.ρw_i).and(&h_col_sum).for_each(
-                |w_ik, ρw_ik, h_col_sum_k| {
-                    *w_ik = (*w_ik * ρw_ik / h_col_sum_k).max(EPS);
-                },
-            );
-
-            // for each j (second pass to accumulate updates to ρh)
-            Zip::from(indices_row).and(data_row).for_each(|&j, &x_ij| {
-                let j = j as usize;
-                let u_ij = w_i.dot(&ht.row(j));
+                // for each j
+                for p in x.indptr[i] as usize..x.indptr[i + 1] as usize {
+                    let h_j = ht_ro.row(x.indices[p] as usize);
+                    let x_ij = x.data[p];
+                    let u_ij = w_i.dot(&h_j);
+                    if compute_loss && x_ij > 0.0 {
+                        let x_ij = x_ij as f64;
+                        nz_loss_i += x_ij * (x_ij / u_ij as f64).ln() - x_ij;
+                    }
+                    ρw_i.scaled_add(x_ij / u_ij, &h_j);
+                }
 
                 // for each k
-                Zip::from(tl.ρht.row_mut(j))
-                    .and(&w_i)
-                    .for_each(|ρh_jk, &w_ik| {
-                        *ρh_jk += w_ik * x_ij / u_ij;
-                    });
-            });
-        });
+                Zip::from(&mut w_i).and(&*ρw_i).and(&h_col_sum).for_each(
+                    |w_ik, ρw_ik, h_col_sum_k| {
+                        *w_ik = (*w_ik * ρw_ik / h_col_sum_k).max(EPS);
+                    },
+                );
 
+                nz_loss_i
+            },
+        )
+        .sum();
+
+    // update H
     let w_col_sum = w.sum_axis(Axis(0));
+    let w_ro = &*w;
+    ht.axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .for_each_init(
+            || Array1::<f32>::zeros(k),
+            |ρh_j, (j, mut h_j)| {
+                ρh_j.fill(0_f32);
 
-    // accumulate everything into the first thread's ρht matrix
-    let mut slot0 = work.slots.first().unwrap().lock().unwrap();
-    let ρht = &mut slot0.ρht;
+                // for each i
+                for q in csc.indptr[j]..csc.indptr[j + 1] {
+                    let w_i = w_ro.row(csc.indices[q] as usize);
+                    let r_ij = csc.data[q] / w_i.dot(&h_j);
+                    ρh_j.scaled_add(r_ij, &w_i);
+                }
 
-    for slot in &work.slots[1..] {
-        ρht.add_assign(&slot.lock().unwrap().ρht);
-    }
+                // for each k
+                Zip::from(&mut h_j).and(&*ρh_j).and(&w_col_sum).for_each(
+                    |h_jk, ρh_jk, w_col_sum_k| {
+                        *h_jk = (*h_jk * ρh_jk / w_col_sum_k).max(EPS);
+                    },
+                );
+            },
+        );
 
-    // for each j (multiplicative update of h)
-    Zip::from(ht.rows_mut())
-        .and(ρht.rows())
-        .for_each(|ht_j, ρht_j| {
-            // for each k
-            Zip::from(ht_j)
-                .and(ρht_j)
-                .and(&w_col_sum)
-                .for_each(|h_kj, ρh_kj, w_col_sum_k| {
-                    *h_kj = (*h_kj * ρh_kj / w_col_sum_k).max(EPS);
-                });
-        })
+    u_sum.map(|u_sum| nz_loss + u_sum)
 }
 
 #[cfg(test)]
@@ -299,10 +326,15 @@ mod tests {
             eval_every: 1,
             verbose: false,
         };
-        let result = nmf(data.view(), indices.view(), indptr.view(), w, ht, &opts);
+        let x = CSR {
+            data: data.view(),
+            indices: indices.view(),
+            indptr: indptr.view(),
+        };
+        let result = nmf(&x, w, ht, &opts);
 
         assert_eq!(result.n_iter, opts.max_iter);
-        assert_eq!(result.loss.len(), opts.max_iter);
+        assert_eq!(result.loss.len(), opts.max_iter + 1);
         for pair in result.loss.windows(2) {
             let (prev, next) = (pair[0].1, pair[1].1);
             assert!(next.is_finite());
