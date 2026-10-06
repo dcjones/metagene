@@ -1,3 +1,4 @@
+use crate::kernels::{Isa, axpy, dispatch, dot, prefetch};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip, s};
 use rayon::prelude::*;
 use std::ops::Range;
@@ -12,6 +13,10 @@ const PAR_GRAIN: usize = 4;
 // same block at once, so this should fit comfortably in (shared) L3. Tuned on a Ryzen 9 5950X
 // (2 × 32MB L3); 4–16MB all perform similarly.
 const H_PASS_BLOCK_BYTES: usize = 8 << 20;
+
+// How many nonzeros ahead to prefetch the gathered factor row. Helps mainly when SMT isn't already
+// hiding the latency.
+const PREFETCH_DISTANCE: usize = 2;
 
 pub struct NMFOptions {
     // maximum number of iterations
@@ -71,6 +76,16 @@ pub struct CSR<'a> {
     pub indptr: ArrayView1<'a, u32>,
 }
 
+impl CSR<'_> {
+    fn slices(&self) -> (&[f32], &[u32], &[u32]) {
+        (
+            self.data.as_slice().expect("data must be contiguous"),
+            self.indices.as_slice().expect("indices must be contiguous"),
+            self.indptr.as_slice().expect("indptr must be contiguous"),
+        )
+    }
+}
+
 // An optimized KL-NMF implementation, using extrapolated multiplicative updates, and parallelized across
 // rows (typically, cells).
 //
@@ -92,6 +107,7 @@ pub fn nmf(
     assert_eq!(x.data.len(), x.indices.len());
     assert_eq!(x.indptr[m] as usize, x.data.len());
 
+    let isa = Isa::detect();
     let start = Instant::now();
     // time spent evaluating the objective outside of the update passes, excluded from timings
     let mut eval_time = Duration::ZERO;
@@ -138,19 +154,19 @@ pub fn nmf(
         let mut l = None;
         if eval && !fused_eval {
             let t0 = Instant::now();
-            l = Some(kl_divergence(x, w.view(), ht.view()));
+            l = Some(kl_divergence(x, w.view(), ht.view(), isa));
             eval_time += t0.elapsed();
         }
 
         if let Some(w_prev) = &mut w_prev {
             extrapolate(&mut w, w_prev, β);
         }
-        let l_fused = update_w(x, &mut w, &ht, fused_eval);
+        let l_fused = update_w(x, &mut w, &ht, fused_eval, isa);
         if opts.fit_h {
             if let Some(ht_prev) = &mut ht_prev {
                 extrapolate(&mut ht, ht_prev, β);
             }
-            update_h(csc.as_ref().unwrap(), &mut ρht, &w, &mut ht);
+            update_h(csc.as_ref().unwrap(), &mut ρht, &w, &mut ht, isa);
         }
         n_iter = iter + 1;
 
@@ -182,7 +198,7 @@ pub fn nmf(
     if opts.eval_every > 0 {
         let t = elapsed(eval_time);
         let t0 = Instant::now();
-        let l = kl_divergence(x, w.view(), ht.view());
+        let l = kl_divergence(x, w.view(), ht.view(), isa);
         eval_time += t0.elapsed();
         record(n_iter, t, l);
     }
@@ -197,36 +213,46 @@ pub fn nmf(
 
 // Generalized KL divergence D(X || W Hᵀ). Only nonzero entries of X contribute log terms, and
 // Σ_ij u_ij factorizes as Σ_k (Σ_i w_ik)(Σ_j h_jk).
-pub fn kl_divergence(
-    x: &CSR,
-    w: ArrayView2<f32>,  // [m, k]
-    ht: ArrayView2<f32>, // [n, k]
-) -> f64 {
+fn kl_divergence(x: &CSR, w: ArrayView2<f32>, ht: ArrayView2<f32>, isa: Isa) -> f64 {
+    let k = w.ncols();
+    let (data, indices, indptr) = x.slices();
+    let w_s = w.as_slice().expect("w must be contiguous");
+    let ht_s = ht.as_slice().expect("ht must be contiguous");
+
     let nz_part: f64 = (0..w.nrows())
         .into_par_iter()
         .with_max_len(PAR_GRAIN)
         .map(|i| {
-            let idx_from = x.indptr[i] as usize;
-            let idx_to = x.indptr[i + 1] as usize;
-            let w_i = w.row(i);
-            let mut acc = 0_f64;
-            for (&j, &x_ij) in x
-                .indices
-                .slice(s![idx_from..idx_to])
-                .iter()
-                .zip(x.data.slice(s![idx_from..idx_to]))
-            {
-                if x_ij > 0.0 {
-                    let x_ij = x_ij as f64;
-                    let u_ij = w_i.dot(&ht.row(j as usize)) as f64;
-                    acc += x_ij * (x_ij / u_ij).ln() - x_ij;
-                }
-            }
-            acc
+            let range = indptr[i] as usize..indptr[i + 1] as usize;
+            let w_i = &w_s[i * k..(i + 1) * k];
+            dispatch!(isa, kl_row(w_i, ht_s, k, data, indices, range))
         })
         .sum();
 
     nz_part + col_sum_f64(w).dot(&col_sum_f64(ht))
+}
+
+// Σ_j x_ij log(x_ij / u_ij) - x_ij over the nonzeros of row i.
+#[inline(always)]
+fn kl_row<const AVX2: bool>(
+    w_i: &[f32],
+    ht: &[f32],
+    k: usize,
+    data: &[f32],
+    indices: &[u32],
+    range: Range<usize>,
+) -> f64 {
+    let mut acc = 0_f64;
+    for p in range {
+        let x_ij = data[p];
+        if x_ij > 0.0 {
+            let j = indices[p] as usize;
+            let x_ij = x_ij as f64;
+            let u_ij = dot::<AVX2>(w_i, &ht[j * k..(j + 1) * k]) as f64;
+            acc += x_ij * (x_ij / u_ij).ln() - x_ij;
+        }
+    }
+    acc
 }
 
 // Column sums accumulated in f64, in parallel over rows.
@@ -306,6 +332,31 @@ impl BlockedCSC {
 
 const EPS: f32 = 1e-6;
 
+// Add row j's contributions from one block of cells, whose nonzeros are at `range`, to ρh_j.
+#[inline(always)]
+fn accumulate_h_row<const AVX2: bool>(
+    ρh_j: &mut [f32],
+    h_j: &[f32],
+    w: &[f32],
+    data: &[f32],
+    indices: &[u32],
+    range: Range<usize>,
+) {
+    let k = h_j.len();
+    let q_to = range.end;
+    // for each i in the block
+    for q in range {
+        if let Some(&i) = indices[..q_to].get(q + PREFETCH_DISTANCE) {
+            let i = i as usize;
+            prefetch(&w[i * k..(i + 1) * k]);
+        }
+        let i = indices[q] as usize;
+        let w_i = &w[i * k..(i + 1) * k];
+        let r_ij = data[q] / dot::<AVX2>(w_i, h_j);
+        axpy::<AVX2>(r_ij, w_i, ρh_j);
+    }
+}
+
 // BMMe extrapolation: a += β max(a - a_prev, 0), after setting a_prev to the current a.
 fn extrapolate(a: &mut Array2<f32>, a_prev: &mut Array2<f32>, β: f32) {
     Zip::from(a).and(a_prev).par_for_each(|a, a_prev| {
@@ -325,8 +376,9 @@ fn mu_step(
     ht: &mut Array2<f32>,
     compute_loss: bool,
 ) -> Option<f64> {
-    let l = update_w(x, w, ht, compute_loss);
-    update_h(csc, ρht, w, ht);
+    let isa = Isa::detect();
+    let l = update_w(x, w, ht, compute_loss, isa);
+    update_h(csc, ρht, w, ht, isa);
     l
 }
 
@@ -338,6 +390,7 @@ fn update_w(
     w: &mut Array2<f32>, // [m, k]
     ht: &Array2<f32>,    // [n, k]
     compute_loss: bool,
+    isa: Isa,
 ) -> Option<f64> {
     let k = w.ncols();
 
@@ -345,42 +398,73 @@ fn update_w(
     let u_sum = compute_loss.then(|| col_sum_f64(w.view()).dot(&col_sum_f64(ht.view())));
 
     let h_col_sum = ht.sum_axis(Axis(0));
+    let h_col_sum = h_col_sum.as_slice().unwrap();
+    let ht = ht.as_slice().expect("ht must be contiguous");
+    let (data, indices, indptr) = x.slices();
+
     let nz_loss: f64 = w
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
+        .as_slice_mut()
+        .expect("w must be contiguous")
+        .par_chunks_mut(k)
         .with_max_len(PAR_GRAIN)
         .enumerate()
         .map_init(
-            || Array1::<f32>::zeros(k),
-            |ρw_i, (i, mut w_i)| {
-                ρw_i.fill(0_f32);
-                let mut nz_loss_i = 0_f64;
-
-                // for each j
-                for p in x.indptr[i] as usize..x.indptr[i + 1] as usize {
-                    let h_j = ht.row(x.indices[p] as usize);
-                    let x_ij = x.data[p];
-                    let u_ij = w_i.dot(&h_j);
-                    if compute_loss && x_ij > 0.0 {
-                        let x_ij = x_ij as f64;
-                        nz_loss_i += x_ij * (x_ij / u_ij as f64).ln() - x_ij;
-                    }
-                    ρw_i.scaled_add(x_ij / u_ij, &h_j);
-                }
-
-                // for each k
-                Zip::from(&mut w_i).and(&*ρw_i).and(&h_col_sum).for_each(
-                    |w_ik, ρw_ik, h_col_sum_k| {
-                        *w_ik = (*w_ik * ρw_ik / h_col_sum_k).max(EPS);
-                    },
-                );
-
-                nz_loss_i
+            || vec![0_f32; k],
+            |ρw_i, (i, w_i)| {
+                let range = indptr[i] as usize..indptr[i + 1] as usize;
+                dispatch!(
+                    isa,
+                    update_w_row(w_i, ρw_i, ht, h_col_sum, data, indices, range, compute_loss)
+                )
             },
         )
         .sum();
 
     u_sum.map(|u_sum| nz_loss + u_sum)
+}
+
+// Multiplicative update of row i of W, whose nonzeros in X are at `range`. Returns the row's
+// contribution to the objective's nonzero terms if `compute_loss`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn update_w_row<const AVX2: bool>(
+    w_i: &mut [f32],
+    ρw_i: &mut [f32],
+    ht: &[f32],
+    h_col_sum: &[f32],
+    data: &[f32],
+    indices: &[u32],
+    range: Range<usize>,
+    compute_loss: bool,
+) -> f64 {
+    let k = w_i.len();
+    ρw_i.fill(0_f32);
+    let mut nz_loss_i = 0_f64;
+
+    // for each j
+    let p_to = range.end;
+    for p in range {
+        if let Some(&j) = indices[..p_to].get(p + PREFETCH_DISTANCE) {
+            let j = j as usize;
+            prefetch(&ht[j * k..(j + 1) * k]);
+        }
+        let j = indices[p] as usize;
+        let h_j = &ht[j * k..(j + 1) * k];
+        let x_ij = data[p];
+        let u_ij = dot::<AVX2>(w_i, h_j);
+        if compute_loss && x_ij > 0.0 {
+            let x_ij = x_ij as f64;
+            nz_loss_i += x_ij * (x_ij / u_ij as f64).ln() - x_ij;
+        }
+        axpy::<AVX2>(x_ij / u_ij, h_j, ρw_i);
+    }
+
+    // for each k
+    for ((w_ik, ρw_ik), h_col_sum_k) in w_i.iter_mut().zip(&*ρw_i).zip(h_col_sum) {
+        *w_ik = (*w_ik * ρw_ik / h_col_sum_k).max(EPS);
+    }
+
+    nz_loss_i
 }
 
 // Multiplicative update of H, column-parallel over CSC, one block of cells at a time.
@@ -389,36 +473,38 @@ fn update_h(
     ρht: &mut Array2<f32>, // [n, k] accumulator, all zeros on entry and exit
     w: &Array2<f32>,       // [m, k]
     ht: &mut Array2<f32>,  // [n, k]
+    isa: Isa,
 ) {
+    let k = w.ncols();
     let w_col_sum = w.sum_axis(Axis(0));
-    let ht_ro = &*ht;
+    let w_col_sum = w_col_sum.as_slice().unwrap();
+    let w = w.as_slice().expect("w must be contiguous");
+    let ht = ht.as_slice_mut().expect("ht must be contiguous");
+    let ρht = ρht.as_slice_mut().expect("ρht must be contiguous");
+
     for block in &csc.blocks {
-        ρht.axis_iter_mut(Axis(0))
-            .into_par_iter()
+        let ht = &*ht;
+        ρht.par_chunks_mut(k)
             .with_max_len(PAR_GRAIN)
             .enumerate()
-            .for_each(|(j, mut ρh_j)| {
-                let h_j = ht_ro.row(j);
-
-                // for each i in the block
-                for q in block.indptr[j]..block.indptr[j + 1] {
-                    let w_i = w.row(block.indices[q] as usize);
-                    let r_ij = block.data[q] / w_i.dot(&h_j);
-                    ρh_j.scaled_add(r_ij, &w_i);
-                }
+            .for_each(|(j, ρh_j)| {
+                let h_j = &ht[j * k..(j + 1) * k];
+                let range = block.indptr[j]..block.indptr[j + 1];
+                dispatch!(
+                    isa,
+                    accumulate_h_row(ρh_j, h_j, w, &block.data, &block.indices, range)
+                );
             });
     }
 
-    Zip::from(ht.rows_mut())
-        .and(ρht.rows_mut())
-        .par_for_each(|mut h_j, mut ρh_j| {
+    ht.par_chunks_mut(k)
+        .zip(ρht.par_chunks_mut(k))
+        .with_max_len(PAR_GRAIN)
+        .for_each(|(h_j, ρh_j)| {
             // for each k
-            Zip::from(&mut h_j)
-                .and(&ρh_j)
-                .and(&w_col_sum)
-                .for_each(|h_jk, ρh_jk, w_col_sum_k| {
-                    *h_jk = (*h_jk * ρh_jk / w_col_sum_k).max(EPS);
-                });
+            for ((h_jk, ρh_jk), w_col_sum_k) in h_j.iter_mut().zip(&*ρh_j).zip(w_col_sum) {
+                *h_jk = (*h_jk * ρh_jk / w_col_sum_k).max(EPS);
+            }
             ρh_j.fill(0_f32);
         });
 }
