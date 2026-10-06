@@ -1,10 +1,16 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip, s};
 use rayon::prelude::*;
+use std::ops::Range;
 
 // Maximum number of rows (or columns) per rayon task. Per-row work varies a lot (cells differ in
 // depth, genes in detection rate) and inputs are often ordered in ways that cluster heavy rows, so
 // without this rayon's default ~1 chunk per thread can leave most threads idle.
 const PAR_GRAIN: usize = 4;
+
+// Target size of the slice of W touched by one cell block in the H pass. Every thread works on the
+// same block at once, so this should fit comfortably in (shared) L3. Tuned on a Ryzen 9 5950X
+// (2 × 32MB L3); 4–16MB all perform similarly.
+const H_PASS_BLOCK_BYTES: usize = 8 << 20;
 
 pub struct NMFOptions {
     // maximum number of iterations
@@ -61,8 +67,6 @@ pub fn nmf(
     mut ht: Array2<f32>, // [n, k]
     opts: &NMFOptions,
 ) -> NMFResult {
-    // TODO: There are gains to be had by re-ordering the cells/genes to improve cache locality.
-
     let (m, k) = w.dim();
     let n = ht.nrows();
     assert_eq!(ht.ncols(), k);
@@ -70,7 +74,9 @@ pub fn nmf(
     assert_eq!(x.data.len(), x.indices.len());
     assert_eq!(x.indptr[m] as usize, x.data.len());
 
-    let csc = CSC::from_csr(x, n);
+    let block_rows = (H_PASS_BLOCK_BYTES / (k * size_of::<f32>())).max(1);
+    let csc = BlockedCSC::from_csr(x, n, block_rows);
+    let mut ρht = Array2::<f32>::zeros((n, k));
     let mut loss = Vec::new();
     let mut prev_loss = f64::INFINITY;
     let mut n_iter = 0;
@@ -85,7 +91,7 @@ pub fn nmf(
     for iter in 0..opts.max_iter {
         // The objective is computed during the step, for the state before the step.
         let eval = opts.eval_every > 0 && iter % opts.eval_every == 0;
-        let l = mu_step(x, &csc, &mut w, &mut ht, eval);
+        let l = mu_step(x, &csc, &mut ρht, &mut w, &mut ht, eval);
         n_iter = iter + 1;
 
         if let Some(l) = l {
@@ -160,8 +166,7 @@ fn col_sum_f64(a: ArrayView2<f32>) -> Array1<f64> {
         .reduce(|| Array1::<f64>::zeros(k), |a, b| a + b)
 }
 
-// Transposed (CSC) copy of the sparsity structure of X, so H can be updated in a column-parallel
-// pass where each thread owns the rows of H it writes.
+// Transposed (CSC) copy of a contiguous block of rows of X. Row indices are global.
 struct CSC {
     data: Vec<f32>,
     indices: Vec<u32>, // row (cell) indices
@@ -169,12 +174,13 @@ struct CSC {
 }
 
 impl CSC {
-    fn from_csr(x: &CSR, n: usize) -> Self {
-        let m = x.indptr.len() - 1;
-        let nnz = x.data.len();
+    fn from_csr(x: &CSR, n: usize, rows: Range<usize>) -> Self {
+        let p_from = x.indptr[rows.start] as usize;
+        let p_to = x.indptr[rows.end] as usize;
+        let nnz = p_to - p_from;
 
         let mut csc_indptr = vec![0_usize; n + 1];
-        for &j in x.indices {
+        for &j in x.indices.slice(s![p_from..p_to]) {
             csc_indptr[j as usize + 1] += 1;
         }
         for j in 0..n {
@@ -184,7 +190,7 @@ impl CSC {
         let mut next = csc_indptr.clone();
         let mut csc_data = vec![0_f32; nnz];
         let mut csc_indices = vec![0_u32; nnz];
-        for i in 0..m {
+        for i in rows {
             for p in x.indptr[i] as usize..x.indptr[i + 1] as usize {
                 let j = x.indices[p] as usize;
                 csc_data[next[j]] = x.data[p];
@@ -201,14 +207,32 @@ impl CSC {
     }
 }
 
+// CSC copy of X split into blocks of cells, so H can be updated in a column-parallel pass where each
+// thread owns the rows of H it writes, while the rows of W being gathered stay in cache.
+struct BlockedCSC {
+    blocks: Vec<CSC>,
+}
+
+impl BlockedCSC {
+    fn from_csr(x: &CSR, n: usize, block_rows: usize) -> Self {
+        let m = x.indptr.len() - 1;
+        let blocks = (0..m.div_ceil(block_rows).max(1))
+            .into_par_iter()
+            .map(|b| CSC::from_csr(x, n, b * block_rows..((b + 1) * block_rows).min(m)))
+            .collect();
+        Self { blocks }
+    }
+}
+
 // One multiplicative update of W (row-parallel over CSR), followed by one of H using the updated W
-// (column-parallel over CSC). If `compute_loss`, also returns the KL divergence of the state prior
+// (column-parallel over CSC, one block of cells at a time). If `compute_loss`, also returns the KL divergence of the state prior
 // to the update, which is nearly free since the W pass already computes u_ij at each nonzero.
 fn mu_step(
     x: &CSR,
-    csc: &CSC,
-    w: &mut Array2<f32>,  // [m, k]
-    ht: &mut Array2<f32>, // [n, k]
+    csc: &BlockedCSC,
+    ρht: &mut Array2<f32>, // [n, k] accumulator, all zeros on entry and exit
+    w: &mut Array2<f32>,   // [m, k]
+    ht: &mut Array2<f32>,  // [n, k]
     compute_loss: bool,
 ) -> Option<f64> {
     const EPS: f32 = 1e-6;
@@ -258,30 +282,36 @@ fn mu_step(
     // update H
     let w_col_sum = w.sum_axis(Axis(0));
     let w_ro = &*w;
-    ht.axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .with_max_len(PAR_GRAIN)
-        .enumerate()
-        .for_each_init(
-            || Array1::<f32>::zeros(k),
-            |ρh_j, (j, mut h_j)| {
-                ρh_j.fill(0_f32);
+    let ht_ro = &*ht;
+    for block in &csc.blocks {
+        ρht.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .with_max_len(PAR_GRAIN)
+            .enumerate()
+            .for_each(|(j, mut ρh_j)| {
+                let h_j = ht_ro.row(j);
 
-                // for each i
-                for q in csc.indptr[j]..csc.indptr[j + 1] {
-                    let w_i = w_ro.row(csc.indices[q] as usize);
-                    let r_ij = csc.data[q] / w_i.dot(&h_j);
+                // for each i in the block
+                for q in block.indptr[j]..block.indptr[j + 1] {
+                    let w_i = w_ro.row(block.indices[q] as usize);
+                    let r_ij = block.data[q] / w_i.dot(&h_j);
                     ρh_j.scaled_add(r_ij, &w_i);
                 }
+            });
+    }
 
-                // for each k
-                Zip::from(&mut h_j).and(&*ρh_j).and(&w_col_sum).for_each(
-                    |h_jk, ρh_jk, w_col_sum_k| {
-                        *h_jk = (*h_jk * ρh_jk / w_col_sum_k).max(EPS);
-                    },
-                );
-            },
-        );
+    Zip::from(ht.rows_mut())
+        .and(ρht.rows_mut())
+        .par_for_each(|mut h_j, mut ρh_j| {
+            // for each k
+            Zip::from(&mut h_j)
+                .and(&ρh_j)
+                .and(&w_col_sum)
+                .for_each(|h_jk, ρh_jk, w_col_sum_k| {
+                    *h_jk = (*h_jk * ρh_jk / w_col_sum_k).max(EPS);
+                });
+            ρh_j.fill(0_f32);
+        });
 
     u_sum.map(|u_sum| nz_loss + u_sum)
 }
@@ -356,5 +386,36 @@ mod tests {
             last < 0.9 * first,
             "objective barely decreased: {first} -> {last}"
         );
+    }
+
+    #[test]
+    fn blocking_does_not_change_result() {
+        let (m, n, k) = (200, 80, 5);
+        let mut rng = Lcg(5678);
+        let (data, indices, indptr) = random_csr(&mut rng, m, n);
+        let x = CSR {
+            data: data.view(),
+            indices: indices.view(),
+            indptr: indptr.view(),
+        };
+        let w0 = Array2::from_shape_simple_fn((m, k), || 0.1 + rng.next_f32());
+        let ht0 = Array2::from_shape_simple_fn((n, k), || 0.1 + rng.next_f32());
+
+        let run = |block_rows: usize| {
+            let csc = BlockedCSC::from_csr(&x, n, block_rows);
+            let mut ρht = Array2::zeros((n, k));
+            let (mut w, mut ht) = (w0.clone(), ht0.clone());
+            let losses: Vec<_> = (0..10)
+                .map(|_| mu_step(&x, &csc, &mut ρht, &mut w, &mut ht, true).unwrap())
+                .collect();
+            (csc.blocks.len(), w, ht, losses)
+        };
+
+        let (nb1, w1, ht1, l1) = run(m);
+        let (nb2, w2, ht2, l2) = run(7);
+        assert_eq!((nb1, nb2), (1, m.div_ceil(7)));
+        assert_eq!(w1, w2);
+        assert_eq!(ht1, ht2);
+        assert_eq!(l1, l2);
     }
 }
