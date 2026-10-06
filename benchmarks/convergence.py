@@ -11,7 +11,9 @@ existing comparison later:
 Each trace is measured against the best objective reached for that seed. Measured against its own
 final value, a run's gap always plunges to zero at its last iteration whether or not it has
 converged, so a much longer reference run per seed should be included (`--ref-iters`, saved as
-ref_seed*.csv). Reference runs only set the best objective; they are not reported or plotted.
+ref_seed*.csv). Reference runs only set the best objective; they are not reported or plotted. Runs
+of a nonconvex problem can settle in different local minima, so several references per seed can
+be kept (`--ref-name ref-<something>`); the lowest one is used.
 Gaps much smaller than the reference's own remaining gap are still unreliable.
 
 Requires the `bench` extra (h5py, zarr, matplotlib).
@@ -20,15 +22,19 @@ Requires the `bench` extra (h5py, zarr, matplotlib).
 import argparse
 import csv
 import json
+import os
 import re
 import sys
 import time
 from collections import defaultdict
 from pathlib import Path
 
-import numpy as np
+# numpy's OpenBLAS worker threads otherwise spin-wait in this process and steal CPU from metagene.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
-import metagene
+import numpy as np  # noqa: E402
+
+import metagene  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).parent))
 from datasets import load  # noqa: E402
@@ -116,7 +122,7 @@ def cmd_run(args):
             res = get_method(args.ref_method)(
                 X, args.k, W0, H0, args.ref_iters, None, args.threads, max(args.ref_iters // 1000, 1)
             )
-            save(REF, seed, res)
+            save(args.ref_name, seed, res)
         for name in args.methods:
             res = get_method(name)(X, args.k, W0, H0, args.max_iter, args.max_time, args.threads, args.eval_every)
             save(name, seed, res)
@@ -144,22 +150,27 @@ def report(out, plot=False):
     traces = read_traces(out)
     best = {seed: min(kl.min() for _, _, kl in runs.values()) for seed, runs in traces.items()}
 
-    missing_ref = sorted(s for s, runs in traces.items() if REF not in runs)
+    def is_ref(m):
+        return m.startswith(REF)
+
+    missing_ref = sorted(s for s, runs in traces.items() if not any(map(is_ref, runs)))
     if missing_ref:
         print(f"warning: no reference run for seeds {missing_ref}; gaps near the end of runs are meaningless")
     ref_tail = []
     for seed, runs in traces.items():
-        if REF in runs:
-            its, _, kls = runs[REF]
+        refs = {m: tr for m, tr in runs.items() if is_ref(m)}
+        if refs:
+            best_ref = min(refs, key=lambda m: refs[m][2].min())
+            its, _, kls = refs[best_ref]
             ref_kl = kls.min()
-            # how much the reference still improved over its last 10% of iterations
+            # how much the best reference still improved over its last 10% of iterations
             tail = kls[its >= 0.9 * its[-1]]
             ref_tail.append((tail[0] - tail[-1]) / tail[-1])
             for m, (_, _, kl) in runs.items():
-                if m != REF and kl.min() < ref_kl:
-                    print(f"warning: seed {seed} {m} beats the reference by "
-                          f"{(ref_kl - kl.min()) / ref_kl:.1e}; use a longer --ref-iters")
-        traces[seed] = {m: tr for m, tr in runs.items() if m != REF}
+                if not is_ref(m) and kl.min() < ref_kl:
+                    print(f"warning: seed {seed} {m} beats the references by "
+                          f"{(ref_kl - kl.min()) / ref_kl:.1e}; add a longer or different reference")
+        traces[seed] = {m: tr for m, tr in runs.items() if not is_ref(m)}
     methods = sorted({m for runs in traces.values() for m in runs}, key=method_order)
 
     # median over seeds of time / iterations to reach each relative gap to the best objective
@@ -232,6 +243,7 @@ def main():
     r.add_argument("--threads", type=int)
     r.add_argument("--ref-iters", type=int, help="also run a reference of this many iterations per seed")
     r.add_argument("--ref-method", default="mu")
+    r.add_argument("--ref-name", default=REF, help=f"name for the reference traces; must start with {REF!r}")
     r.add_argument("--out", required=True)
     r.add_argument("--plot", action="store_true")
     r.set_defaults(func=cmd_run)
@@ -242,6 +254,8 @@ def main():
     s.set_defaults(func=lambda a: report(a.out, a.plot))
 
     args = p.parse_args()
+    if not getattr(args, "ref_name", REF).startswith(REF):
+        p.error(f"--ref-name must start with {REF!r}")
     for name in getattr(args, "methods", []) + [getattr(args, "ref_method", "mu")]:
         get_method(name)
     args.func(args)
