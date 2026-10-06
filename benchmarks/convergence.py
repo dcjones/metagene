@@ -98,7 +98,7 @@ def cmd_run(args):
             )
             save(REF, seed, res)
         for name in args.methods:
-            res = METHODS[name](X, args.k, W0, H0, args.max_iter, args.max_time, args.threads, 1)
+            res = METHODS[name](X, args.k, W0, H0, args.max_iter, args.max_time, args.threads, args.eval_every)
             save(name, seed, res)
 
     report(out, args.plot)
@@ -205,6 +205,9 @@ def main():
     r.add_argument("--methods", nargs="*", default=list(METHODS), choices=list(METHODS))
     r.add_argument("--max-iter", type=int, default=1000)
     r.add_argument("--max-time", type=float, help="per-run time limit in seconds")
+    r.add_argument("--eval-every", type=int, default=1,
+                   help="evaluate the objective every this many iterations (excluded from timings, but "
+                        "for methods that can't evaluate it for free it still costs wall time)")
     r.add_argument("--threads", type=int)
     r.add_argument("--ref-iters", type=int, help="also run a reference of this many iterations per seed")
     r.add_argument("--ref-method", default="mu", choices=list(METHODS))

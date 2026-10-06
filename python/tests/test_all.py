@@ -29,7 +29,7 @@ def test_shapes_and_nonnegativity():
 
 def test_objective_decreases_and_matches_numpy():
     X = random_counts()
-    res = metagene.nmf(X, 4, max_iter=100, tol=-np.inf, eval_every=1, seed=1)
+    res = metagene.nmf(X, 4, method="mu", max_iter=100, tol=-np.inf, eval_every=1, seed=1)
     losses = [l for _, _, l in res.loss]
     times = [t for _, t, _ in res.loss]
     assert all(b >= a for a, b in zip(times, times[1:]))
@@ -71,7 +71,7 @@ def test_matches_reference_mu():
     rng = np.random.default_rng(3)
     W0 = rng.random((300, 4)).astype(np.float32)
     H0 = rng.random((4, 100)).astype(np.float32)
-    res = metagene.nmf(X, 4, max_iter=30, tol=-np.inf, eval_every=0, W0=W0, H0=H0)
+    res = metagene.nmf(X, 4, method="mu", max_iter=30, tol=-np.inf, eval_every=0, W0=W0, H0=H0)
     Wr, Hr = reference_mu(X, W0, H0, 30)
     np.testing.assert_allclose(res.W, Wr, rtol=1e-3, atol=1e-5)
     np.testing.assert_allclose(res.H, Hr, rtol=1e-3, atol=1e-5)

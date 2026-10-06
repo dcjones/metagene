@@ -41,7 +41,7 @@ def nmf(
     X,
     k: int,
     *,
-    method: str = "mu",
+    method: str = "bmme",
     restart: bool = False,
     max_iter: int = 200,
     max_time: float | None = None,
@@ -66,9 +66,11 @@ def nmf(
         Count matrix, typically cells × genes. Converted to CSR float32.
     k : int
         Number of factors.
-    method : {"mu", "bmme"}
-        Plain multiplicative updates, or multiplicative updates with extrapolation (BMMe). The
-        BMMe objective is not monotone, and evaluating it costs an extra pass over the data.
+    method : {"bmme", "mu"}
+        Multiplicative updates with extrapolation (BMMe, the default), or plain multiplicative
+        updates. BMMe costs the same per iteration and typically needs 2-4x fewer iterations to
+        reach a given objective. Its objective isn't guaranteed to be monotone, and evaluating it
+        costs an extra pass over the data (so about 1/eval_every extra W-pass work).
     restart : bool
         With method="bmme", reset the extrapolation whenever an evaluated objective increases.
     max_iter : int

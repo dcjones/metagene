@@ -43,7 +43,7 @@ impl Default for NMFOptions {
             tol: 1e-4,
             eval_every: 10,
             max_time: None,
-            extrapolate: false,
+            extrapolate: true,
             restart: false,
             verbose: false,
         }
