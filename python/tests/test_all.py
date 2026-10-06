@@ -82,3 +82,42 @@ def test_max_time():
     res = metagene.nmf(X, 4, max_iter=10**9, max_time=0.05, tol=-np.inf, seed=0)
     assert res.n_iter < 10**9
     assert 0.05 <= res.loss[-1][1] < 1.0
+
+
+def reference_bmme(X, W, H, iters, eps=1e-6):
+    """Dense float64 port of MUe_KLNMF.m (Hien, Leplat & Gillis), updating W before H."""
+    X = X.toarray().astype(np.float64)
+    W, H = W.astype(np.float64), H.astype(np.float64)
+    W_prev, H_prev = W.copy(), H.copy()
+    t = 1.0
+    for _ in range(iters):
+        t_next = 0.5 * (1 + np.sqrt(1 + 4 * t * t))
+        beta = (t - 1) / t_next
+        t = t_next
+        W_ex = W + beta * np.maximum(W - W_prev, 0)
+        W_prev = W
+        W = np.maximum(W_ex * ((X / (W_ex @ H)) @ H.T) / H.sum(1), eps)
+        H_ex = H + beta * np.maximum(H - H_prev, 0)
+        H_prev = H
+        H = np.maximum(H_ex * (W.T @ (X / (W @ H_ex))) / W.sum(0)[:, None], eps)
+    return W, H
+
+
+def test_matches_reference_bmme():
+    X = random_counts()
+    rng = np.random.default_rng(3)
+    W0 = rng.random((300, 4)).astype(np.float32)
+    H0 = rng.random((4, 100)).astype(np.float32)
+    res = metagene.nmf(X, 4, method="bmme", max_iter=30, tol=-np.inf, eval_every=0, W0=W0, H0=H0)
+    Wr, Hr = reference_bmme(X, W0, H0, 30)
+    np.testing.assert_allclose(res.W, Wr, rtol=1e-3, atol=1e-5)
+    np.testing.assert_allclose(res.H, Hr, rtol=1e-3, atol=1e-5)
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_bmme_loss_is_evaluated_at_iterates(restart):
+    X = random_counts()
+    res = metagene.nmf(X, 4, method="bmme", restart=restart, max_iter=50, tol=-np.inf, eval_every=1, seed=1)
+    final = res.loss[-1][2]
+    assert final == pytest.approx(kl(X, res.W, res.H), rel=1e-4)
+    assert final < 0.5 * res.loss[0][2]

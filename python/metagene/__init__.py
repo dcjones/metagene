@@ -41,6 +41,8 @@ def nmf(
     X,
     k: int,
     *,
+    method: str = "mu",
+    restart: bool = False,
     max_iter: int = 200,
     max_time: float | None = None,
     tol: float = 1e-4,
@@ -53,12 +55,22 @@ def nmf(
 ) -> NMFResult:
     """KL-NMF of a non-negative [m, n] matrix X ≈ W H, using multiplicative updates.
 
+    With method="bmme", each factor is extrapolated before its multiplicative update, following
+
+        Hien, L.T.K., Leplat, V. and Gillis, N. (2025) Block Majorization Minimization with
+        extrapolation and application to β-NMF. SIAM J. Math. Data Sci., 7, 1292–1314.
+
     Parameters
     ----------
     X : scipy sparse matrix or array-like, shape [m, n]
         Count matrix, typically cells × genes. Converted to CSR float32.
     k : int
         Number of factors.
+    method : {"mu", "bmme"}
+        Plain multiplicative updates, or multiplicative updates with extrapolation (BMMe). The
+        BMMe objective is not monotone, and evaluating it costs an extra pass over the data.
+    restart : bool
+        With method="bmme", reset the extrapolation whenever an evaluated objective increases.
     max_iter : int
         Maximum number of iterations.
     max_time : float, optional
@@ -76,6 +88,8 @@ def nmf(
     verbose : bool
         Print the objective to stderr whenever it's evaluated.
     """
+    if method not in ("mu", "bmme"):
+        raise ValueError(f"unknown method {method!r}")
     X = _as_csr(X)
     m, n = X.shape
 
@@ -102,6 +116,7 @@ def nmf(
     ht = np.ascontiguousarray(H0.T, dtype=np.float32)
 
     w, ht, loss, n_iter = _nmf(
-        data, indices, indptr, w, ht, max_iter, tol, eval_every, verbose, n_threads, max_time
+        data, indices, indptr, w, ht, max_iter, tol, eval_every, verbose, n_threads, max_time,
+        method == "bmme", restart,
     )
     return NMFResult(W=w, H=ht.T, loss=loss, n_iter=n_iter)

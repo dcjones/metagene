@@ -12,4 +12,6 @@ def _nmf(
     verbose: bool,
     n_threads: int | None = None,
     max_time: float | None = None,
+    extrapolate: bool = False,
+    restart: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, list[tuple[int, float, float]], int]: ...

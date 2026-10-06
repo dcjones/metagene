@@ -35,11 +35,17 @@ from datasets import load  # noqa: E402
 # Each method is called as f(X, k, W0, H0, max_iter, max_time, n_threads, eval_every) and returns
 # a metagene.NMFResult whose loss records are (iteration, elapsed seconds, kl). Any work a method
 # does before calling metagene.nmf (e.g. fitting a subsample) must be included in those times.
-METHODS = {
-    "mu": lambda X, k, W0, H0, max_iter, max_time, n_threads, eval_every: metagene.nmf(
+def _metagene(**kw):
+    return lambda X, k, W0, H0, max_iter, max_time, n_threads, eval_every: metagene.nmf(
         X, k, W0=W0, H0=H0, max_iter=max_iter, max_time=max_time,
-        tol=-np.inf, eval_every=eval_every, n_threads=n_threads,
-    ),
+        tol=-np.inf, eval_every=eval_every, n_threads=n_threads, **kw,
+    )
+
+
+METHODS = {
+    "mu": _metagene(method="mu"),
+    "bmme": _metagene(method="bmme"),
+    "bmme-restart": _metagene(method="bmme", restart=True),
 }
 
 REF = "ref"

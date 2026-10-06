@@ -26,6 +26,13 @@ pub struct NMFOptions {
     // stop after this many seconds (excluding time spent evaluating the objective separately)
     pub max_time: Option<f64>,
 
+    // Use BMMe: extrapolate each factor (Nesterov-style, positive part only) before its MU step.
+    pub extrapolate: bool,
+
+    // With `extrapolate`, reset the extrapolation sequence whenever an evaluated objective is
+    // higher than the previous evaluation.
+    pub restart: bool,
+
     pub verbose: bool,
 }
 
@@ -36,6 +43,8 @@ impl Default for NMFOptions {
             tol: 1e-4,
             eval_every: 10,
             max_time: None,
+            extrapolate: false,
+            restart: false,
             verbose: false,
         }
     }
@@ -87,8 +96,15 @@ pub fn nmf(
     let block_rows = (H_PASS_BLOCK_BYTES / (k * size_of::<f32>())).max(1);
     let csc = BlockedCSC::from_csr(x, n, block_rows);
     let mut ρht = Array2::<f32>::zeros((n, k));
+
+    // previous iterates, for extrapolation
+    let mut w_prev = opts.extrapolate.then(|| w.clone());
+    let mut ht_prev = opts.extrapolate.then(|| ht.clone());
+    let mut t_nesterov = 1_f64;
+
     let mut loss = Vec::new();
     let mut prev_loss = f64::INFINITY;
+    let mut best_loss = f64::INFINITY;
     let mut n_iter = 0;
 
     let mut record = |iter: usize, t: f64, l: f64| {
@@ -99,19 +115,53 @@ pub fn nmf(
     };
 
     for iter in 0..opts.max_iter {
-        // The objective is computed during the step, for the state before the step.
+        let t_iter = elapsed(eval_time);
+
+        let β = if opts.extrapolate {
+            let t_next = 0.5 * (1.0 + (1.0 + 4.0 * t_nesterov * t_nesterov).sqrt());
+            let β = (t_nesterov - 1.0) / t_next;
+            t_nesterov = t_next;
+            β as f32
+        } else {
+            0.0
+        };
+
+        // The objective of the state before the step. This can be computed nearly for free in the
+        // W pass, unless W is extrapolated first.
         let eval = opts.eval_every > 0 && iter % opts.eval_every == 0;
-        let l = mu_step(x, &csc, &mut ρht, &mut w, &mut ht, eval);
+        let fused_eval = eval && β == 0.0;
+        let mut l = None;
+        if eval && !fused_eval {
+            let t0 = Instant::now();
+            l = Some(kl_divergence(x, w.view(), ht.view()));
+            eval_time += t0.elapsed();
+        }
+
+        if let Some(w_prev) = &mut w_prev {
+            extrapolate(&mut w, w_prev, β);
+        }
+        let l_fused = update_w(x, &mut w, &ht, fused_eval);
+        if let Some(ht_prev) = &mut ht_prev {
+            extrapolate(&mut ht, ht_prev, β);
+        }
+        update_h(&csc, &mut ρht, &w, &mut ht);
         n_iter = iter + 1;
 
-        if let Some(l) = l {
-            // Fused into the step, so the state it describes was reached before the step began.
-            // Timing at the end of the step slightly overstates the time, by under one step.
-            record(iter, elapsed(eval_time), l);
-            if (prev_loss - l) / l.abs().max(f64::MIN_POSITIVE) < opts.tol {
-                break;
+        if let Some(l) = l.or(l_fused) {
+            record(iter, t_iter, l);
+
+            if opts.restart && l > prev_loss {
+                t_nesterov = 1.0;
             }
             prev_loss = l;
+
+            // With extrapolation the objective isn't monotone, so an increase doesn't count as
+            // having converged.
+            let improvement = (best_loss - l) / l.abs().max(f64::MIN_POSITIVE);
+            if (0.0..opts.tol).contains(&improvement) {
+                break;
+            }
+            best_loss = best_loss.min(l);
         }
 
         if opts
@@ -247,26 +297,47 @@ impl BlockedCSC {
     }
 }
 
-// One multiplicative update of W (row-parallel over CSR), followed by one of H using the updated W
-// (column-parallel over CSC, one block of cells at a time). If `compute_loss`, also returns the KL divergence of the state prior
-// to the update, which is nearly free since the W pass already computes u_ij at each nonzero.
+const EPS: f32 = 1e-6;
+
+// BMMe extrapolation: a += β max(a - a_prev, 0), after setting a_prev to the current a.
+fn extrapolate(a: &mut Array2<f32>, a_prev: &mut Array2<f32>, β: f32) {
+    Zip::from(a).and(a_prev).par_for_each(|a, a_prev| {
+        let step = (*a - *a_prev).max(0.0);
+        *a_prev = *a;
+        *a += β * step;
+    });
+}
+
+// One multiplicative update of W followed by one of H using the updated W.
+#[cfg(test)]
 fn mu_step(
     x: &CSR,
     csc: &BlockedCSC,
-    ρht: &mut Array2<f32>, // [n, k] accumulator, all zeros on entry and exit
-    w: &mut Array2<f32>,   // [m, k]
-    ht: &mut Array2<f32>,  // [n, k]
+    ρht: &mut Array2<f32>,
+    w: &mut Array2<f32>,
+    ht: &mut Array2<f32>,
     compute_loss: bool,
 ) -> Option<f64> {
-    const EPS: f32 = 1e-6;
+    let l = update_w(x, w, ht, compute_loss);
+    update_h(csc, ρht, w, ht);
+    l
+}
+
+// Multiplicative update of W, row-parallel over CSR. If `compute_loss`, also returns the KL
+// divergence of the state prior to the update, which is nearly free since this pass already
+// computes u_ij at each nonzero.
+fn update_w(
+    x: &CSR,
+    w: &mut Array2<f32>, // [m, k]
+    ht: &Array2<f32>,    // [n, k]
+    compute_loss: bool,
+) -> Option<f64> {
     let k = w.ncols();
 
     // Σ_ij u_ij term of the objective, from the state prior to the update
     let u_sum = compute_loss.then(|| col_sum_f64(w.view()).dot(&col_sum_f64(ht.view())));
 
-    // update W
     let h_col_sum = ht.sum_axis(Axis(0));
-    let ht_ro = &*ht;
     let nz_loss: f64 = w
         .axis_iter_mut(Axis(0))
         .into_par_iter()
@@ -280,7 +351,7 @@ fn mu_step(
 
                 // for each j
                 for p in x.indptr[i] as usize..x.indptr[i + 1] as usize {
-                    let h_j = ht_ro.row(x.indices[p] as usize);
+                    let h_j = ht.row(x.indices[p] as usize);
                     let x_ij = x.data[p];
                     let u_ij = w_i.dot(&h_j);
                     if compute_loss && x_ij > 0.0 {
@@ -302,9 +373,17 @@ fn mu_step(
         )
         .sum();
 
-    // update H
+    u_sum.map(|u_sum| nz_loss + u_sum)
+}
+
+// Multiplicative update of H, column-parallel over CSC, one block of cells at a time.
+fn update_h(
+    csc: &BlockedCSC,
+    ρht: &mut Array2<f32>, // [n, k] accumulator, all zeros on entry and exit
+    w: &Array2<f32>,       // [m, k]
+    ht: &mut Array2<f32>,  // [n, k]
+) {
     let w_col_sum = w.sum_axis(Axis(0));
-    let w_ro = &*w;
     let ht_ro = &*ht;
     for block in &csc.blocks {
         ρht.axis_iter_mut(Axis(0))
@@ -316,7 +395,7 @@ fn mu_step(
 
                 // for each i in the block
                 for q in block.indptr[j]..block.indptr[j + 1] {
-                    let w_i = w_ro.row(block.indices[q] as usize);
+                    let w_i = w.row(block.indices[q] as usize);
                     let r_ij = block.data[q] / w_i.dot(&h_j);
                     ρh_j.scaled_add(r_ij, &w_i);
                 }
@@ -335,8 +414,6 @@ fn mu_step(
                 });
             ρh_j.fill(0_f32);
         });
-
-    u_sum.map(|u_sum| nz_loss + u_sum)
 }
 
 #[cfg(test)]
@@ -386,6 +463,8 @@ mod tests {
             tol: f64::NEG_INFINITY,
             eval_every: 1,
             max_time: None,
+            extrapolate: false,
+            restart: false,
             verbose: false,
         };
         let x = CSR {
