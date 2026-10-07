@@ -1,4 +1,4 @@
-use crate::kernels::{Isa, axpy, dispatch, dot, prefetch};
+use crate::kernels::{Isa, axpy, axpy_n, dispatch, dot, dot_n, prefetch};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip, s};
 use rayon::prelude::*;
 use std::ops::Range;
@@ -17,6 +17,10 @@ const H_PASS_BLOCK_BYTES: usize = 8 << 20;
 // How many nonzeros ahead to prefetch the gathered factor row. Helps mainly when SMT isn't already
 // hiding the latency.
 const PREFETCH_DISTANCE: usize = 2;
+
+// Nonzeros processed together in the inner loops, so their dependency chains (gather, dot product,
+// division, axpy) overlap, the shared row is loaded once, and the accumulator row is updated once.
+const NNZ_BLOCK: usize = 2;
 
 pub struct NMFOptions {
     // maximum number of iterations
@@ -334,6 +338,7 @@ const EPS: f32 = 1e-6;
 
 // Add row j's contributions from one block of cells, whose nonzeros are at `range`, to ρh_j.
 #[inline(always)]
+#[allow(clippy::needless_range_loop)] // indices address several parallel arrays
 fn accumulate_h_row<const AVX2: bool>(
     ρh_j: &mut [f32],
     h_j: &[f32],
@@ -343,17 +348,30 @@ fn accumulate_h_row<const AVX2: bool>(
     range: Range<usize>,
 ) {
     let k = h_j.len();
-    let q_to = range.end;
-    // for each i in the block
-    for q in range {
-        if let Some(&i) = indices[..q_to].get(q + PREFETCH_DISTANCE) {
-            let i = i as usize;
-            prefetch(&w[i * k..(i + 1) * k]);
-        }
+    let row = |q: usize| {
         let i = indices[q] as usize;
-        let w_i = &w[i * k..(i + 1) * k];
-        let r_ij = data[q] / dot::<AVX2>(w_i, h_j);
-        axpy::<AVX2>(r_ij, w_i, ρh_j);
+        &w[i * k..(i + 1) * k]
+    };
+    let indices = &indices[..range.end];
+
+    // for each i in the block, NNZ_BLOCK at a time
+    let mut q = range.start;
+    while q + NNZ_BLOCK <= range.end {
+        for d in 0..NNZ_BLOCK {
+            if let Some(&i) = indices.get(q + PREFETCH_DISTANCE * NNZ_BLOCK + d) {
+                let i = i as usize;
+                prefetch(&w[i * k..(i + 1) * k]);
+            }
+        }
+        let w_is: [&[f32]; NNZ_BLOCK] = std::array::from_fn(|d| row(q + d));
+        let u = dot_n::<AVX2, NNZ_BLOCK>(h_j, w_is);
+        let r: [f32; NNZ_BLOCK] = std::array::from_fn(|d| data[q + d] / u[d]);
+        axpy_n::<AVX2, NNZ_BLOCK>(r, w_is, ρh_j);
+        q += NNZ_BLOCK;
+    }
+    for q in q..range.end {
+        let w_i = row(q);
+        axpy::<AVX2>(data[q] / dot::<AVX2>(w_i, h_j), w_i, ρh_j);
     }
 }
 
@@ -427,6 +445,7 @@ fn update_w(
 // contribution to the objective's nonzero terms if `compute_loss`.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_range_loop)] // indices address several parallel arrays
 fn update_w_row<const AVX2: bool>(
     w_i: &mut [f32],
     ρw_i: &mut [f32],
@@ -441,22 +460,43 @@ fn update_w_row<const AVX2: bool>(
     ρw_i.fill(0_f32);
     let mut nz_loss_i = 0_f64;
 
-    // for each j
-    let p_to = range.end;
-    for p in range {
-        if let Some(&j) = indices[..p_to].get(p + PREFETCH_DISTANCE) {
-            let j = j as usize;
-            prefetch(&ht[j * k..(j + 1) * k]);
-        }
+    let row = |p: usize| {
         let j = indices[p] as usize;
-        let h_j = &ht[j * k..(j + 1) * k];
-        let x_ij = data[p];
-        let u_ij = dot::<AVX2>(w_i, h_j);
+        &ht[j * k..(j + 1) * k]
+    };
+    let loss = |x_ij: f32, u_ij: f32| {
         if compute_loss && x_ij > 0.0 {
             let x_ij = x_ij as f64;
-            nz_loss_i += x_ij * (x_ij / u_ij as f64).ln() - x_ij;
+            x_ij * (x_ij / u_ij as f64).ln() - x_ij
+        } else {
+            0.0
         }
-        axpy::<AVX2>(x_ij / u_ij, h_j, ρw_i);
+    };
+    let indices = &indices[..range.end];
+
+    // for each j, NNZ_BLOCK at a time
+    let mut p = range.start;
+    while p + NNZ_BLOCK <= range.end {
+        for d in 0..NNZ_BLOCK {
+            if let Some(&j) = indices.get(p + PREFETCH_DISTANCE * NNZ_BLOCK + d) {
+                let j = j as usize;
+                prefetch(&ht[j * k..(j + 1) * k]);
+            }
+        }
+        let h_js: [&[f32]; NNZ_BLOCK] = std::array::from_fn(|d| row(p + d));
+        let u = dot_n::<AVX2, NNZ_BLOCK>(w_i, h_js);
+        let r: [f32; NNZ_BLOCK] = std::array::from_fn(|d| data[p + d] / u[d]);
+        for d in 0..NNZ_BLOCK {
+            nz_loss_i += loss(data[p + d], u[d]);
+        }
+        axpy_n::<AVX2, NNZ_BLOCK>(r, h_js, ρw_i);
+        p += NNZ_BLOCK;
+    }
+    for p in p..range.end {
+        let h_j = row(p);
+        let u_ij = dot::<AVX2>(w_i, h_j);
+        nz_loss_i += loss(data[p], u_ij);
+        axpy::<AVX2>(data[p] / u_ij, h_j, ρw_i);
     }
 
     // for each k
