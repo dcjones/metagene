@@ -66,6 +66,12 @@ Each iteration is a W pass then an H pass (alternating multiplicative updates). 
   added as further `Isa` variants.
 - **Precision:** f32 storage and kernels, f64 accumulation for the objective. Values are clamped at
   `EPS = 1e-6` after each multiplicative update.
+- **EPS was swept** (1e-3 to 1e-12, scRNA, k=100/200, BMMe, 1500 iterations): 1e-5 to 1e-6 is
+  best, and the optimum is flat across that decade. Larger values bias the fit (the floor's mass
+  can't be removed: ~2% worse at 1e-3, ~0.15% at 1e-4); smaller values slow convergence after
+  ~300 iterations because floored entries take longer to recover (2–7e-4 worse at 1e-12). Most
+  entries sit at the floor (~80% of W, ~67% of H) regardless of EPS. The absolute (not
+  data-scale-relative) floor is deliberate, since inputs are assumed to be transcript counts.
 
 ### Tried and rejected (don't redo without new evidence)
 
