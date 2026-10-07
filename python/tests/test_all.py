@@ -169,6 +169,23 @@ def test_warm_start_auto():
         metagene.nmf(X, 4, warm_start=True, warm_start_fraction=0.001, max_iter=5, seed=0)
 
 
+@pytest.mark.parametrize("n_threads", [None, 3])
+def test_sparse_matrix_products(n_threads):
+    X = random_counts(m=200, n=70)
+    rng = np.random.default_rng(0)
+    A = metagene._SparseMatrix(X.data, X.indices.view(np.uint32), X.indptr.view(np.uint32), 70, 13,
+                               n_threads)
+    B = rng.standard_normal((70, 13), dtype=np.float32)
+    C = rng.standard_normal((200, 13), dtype=np.float32)
+    np.testing.assert_allclose(A.matmul(B), X @ B, rtol=1e-4, atol=1e-3)
+    np.testing.assert_allclose(A.rmatmul(C), X.T @ C, rtol=1e-4, atol=1e-3)
+    # non-contiguous operands
+    np.testing.assert_allclose(A.matmul(np.asfortranarray(B)), X @ B, rtol=1e-4, atol=1e-3)
+    np.testing.assert_allclose(A.rmatmul(C[:, ::2]), X.T @ C[:, ::2], rtol=1e-4, atol=1e-3)
+    with pytest.raises(ValueError):
+        A.matmul(C)
+
+
 def test_randomized_svd():
     X = random_counts()
     U, S, Vt = metagene._randomized_svd(X, 4, np.random.default_rng(0))

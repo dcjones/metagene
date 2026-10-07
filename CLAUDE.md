@@ -10,7 +10,10 @@ Fast KL-divergence NMF (X ≈ W H) for large, sparse single-cell / spatial count
   extrapolation, CSR/CSC structures. Tests at the bottom.
 - `src/kernels.rs` — inner-loop kernels (`dot`, `axpy`, fused `dot_n`/`axpy_n`, `prefetch`) in
   portable and AVX2+FMA versions, `Isa` runtime detection, and the `dispatch!` macro.
-- `src/lib.rs` — the `_nmf` Python binding (GIL released, optional rayon pool via `n_threads`).
+- `src/spmm.rs` — sparse × dense products X B (row-parallel CSR) and Xᵀ B (blocked CSC), for the
+  randomized SVD behind NNDSVD init.
+- `src/lib.rs` — the `_nmf` Python binding (GIL released, optional rayon pool via `n_threads`), and
+  `_SparseMatrix` (holds the blocked CSC copy across the SVD's products).
 - `python/metagene/__init__.py` — `metagene.nmf()`: input conversion (any scipy sparse/dense →
   canonical CSR f32/u32 without copying where possible), initialization, warm start.
 - `python/tests/test_all.py` — tests against dense numpy reference implementations of MU and BMMe.
@@ -64,8 +67,10 @@ Each iteration is a W pass then an H pass (alternating multiplicative updates). 
   same cells restricted to their top 380 genes reproduced the gap — it's k/n, not the platform. At
   k=20 on 380 genes the inits were equivalent. sklearn's default nndsvda (zeros filled with the
   mean) was as bad as random; nndsvdar ≈ nndsvd. The randomized SVD runs the range finder on the
-  gene side (QRs are [n, l]; a tall [m, l] QR was ~1 s each) and costs ~3 s on a 40k × 5k
-  subsample, ~13 s on a 66k × 18k one (scipy's single-threaded sparse products dominate).
+  gene side (QRs are [n, l]; a tall [m, l] QR was ~1 s each), with the sparse products in Rust
+  (`_SparseMatrix`): 1.2 s on Atera's 66k × 18k warm-start subsample (was 12.5 s with scipy's
+  single-threaded products), 0.36 s on 40k × 5k. What remains is ~50 ms per product, numpy's
+  [n, l] QRs (~75 ms each), and the CSC build (~0.17 s).
 - **Kernels:** explicit AVX2+FMA intrinsics, chosen at runtime (`Isa::detect`, override with
   `METAGENE_SIMD=portable`). Per-row loop bodies are generic over `const AVX2: bool` and run via
   `dispatch!` inside a `#[target_feature]` wrapper so the whole loop is compiled for AVX2. LLVM did

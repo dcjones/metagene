@@ -2,13 +2,148 @@ use pyo3::prelude::*;
 
 mod kernels;
 mod nmf;
+mod spmm;
 
 #[pymodule]
 mod metagene {
-    use crate::nmf::{CSR, NMFOptions, nmf};
-    use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+    use crate::nmf::{BlockedCSC, CSR, H_PASS_BLOCK_BYTES, NMFOptions, nmf};
+    use crate::spmm::{csc_matmul, csr_matmul};
+    use numpy::{
+        IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    };
     use pyo3::exceptions::PyValueError;
     use pyo3::prelude::*;
+
+    fn thread_pool(n_threads: Option<usize>) -> PyResult<Option<rayon::ThreadPool>> {
+        n_threads
+            .map(|n_threads| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(n_threads)
+                    .build()
+                    .map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+            .transpose()
+    }
+
+    fn check_csr(
+        data: &PyReadonlyArray1<f32>,
+        indices: &PyReadonlyArray1<u32>,
+        indptr: &PyReadonlyArray1<u32>,
+        m: usize,
+        n: usize,
+    ) -> PyResult<()> {
+        let indptr = indptr.as_array();
+        if indptr.len() != m + 1 {
+            return Err(PyValueError::new_err("indptr length must be m + 1"));
+        }
+        let nnz = data.as_array().len();
+        if indices.as_array().len() != nnz || indptr[m] as usize != nnz {
+            return Err(PyValueError::new_err("inconsistent CSR arrays"));
+        }
+        if indices.as_array().iter().any(|&j| j as usize >= n) {
+            return Err(PyValueError::new_err("column index out of bounds"));
+        }
+        Ok(())
+    }
+
+    /// A CSR matrix X [m, n] (borrowing its arrays) for computing X B and Xᵀ B with dense B, as
+    /// needed by the randomized SVD. Building it makes a cache-blocked CSC copy of X (8 bytes per
+    /// nonzero) for Xᵀ B, sized for B with up to `l` columns.
+    #[pyclass(frozen)]
+    struct _SparseMatrix {
+        data: Py<PyArray1<f32>>,
+        indices: Py<PyArray1<u32>>,
+        indptr: Py<PyArray1<u32>>,
+        m: usize,
+        n: usize,
+        csc: BlockedCSC,
+        pool: Option<rayon::ThreadPool>,
+    }
+
+    impl _SparseMatrix {
+        // Run f (without the GIL) on the thread pool, if there is one.
+        fn run<R: Send>(&self, py: Python, f: impl FnOnce() -> R + Send) -> R {
+            py.detach(|| match &self.pool {
+                Some(pool) => pool.install(f),
+                None => f(),
+            })
+        }
+    }
+
+    #[pymethods]
+    impl _SparseMatrix {
+        #[new]
+        #[pyo3(signature = (data, indices, indptr, n, l, n_threads=None))]
+        fn new(
+            py: Python,
+            data: PyReadonlyArray1<f32>,
+            indices: PyReadonlyArray1<u32>,
+            indptr: PyReadonlyArray1<u32>,
+            n: usize,
+            l: usize,
+            n_threads: Option<usize>,
+        ) -> PyResult<Self> {
+            let m = indptr.as_array().len().saturating_sub(1);
+            check_csr(&data, &indices, &indptr, m, n)?;
+            let pool = thread_pool(n_threads)?;
+            let block_rows = (H_PASS_BLOCK_BYTES / (l.max(1) * size_of::<f32>())).max(1);
+            let x = CSR {
+                data: data.as_array(),
+                indices: indices.as_array(),
+                indptr: indptr.as_array(),
+            };
+            let build = || BlockedCSC::from_csr(&x, n, block_rows);
+            let csc = py.detach(|| match &pool {
+                Some(pool) => pool.install(build),
+                None => build(),
+            });
+            Ok(Self {
+                data: data.as_unbound().clone_ref(py),
+                indices: indices.as_unbound().clone_ref(py),
+                indptr: indptr.as_unbound().clone_ref(py),
+                m,
+                n,
+                csc,
+                pool,
+            })
+        }
+
+        /// X B, for B [n, l]. Returns [m, l].
+        fn matmul<'py>(
+            &self,
+            py: Python<'py>,
+            b: PyReadonlyArray2<'py, f32>,
+        ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+            if b.as_array().nrows() != self.n {
+                return Err(PyValueError::new_err("B must have n rows"));
+            }
+            let (data, indices, indptr) = (
+                self.data.bind(py).readonly(),
+                self.indices.bind(py).readonly(),
+                self.indptr.bind(py).readonly(),
+            );
+            let x = CSR {
+                data: data.as_array(),
+                indices: indices.as_array(),
+                indptr: indptr.as_array(),
+            };
+            let b = b.as_array();
+            Ok(self.run(py, || csr_matmul(&x, b)).into_pyarray(py))
+        }
+
+        /// Xᵀ B, for B [m, l]. Returns [n, l].
+        fn rmatmul<'py>(
+            &self,
+            py: Python<'py>,
+            b: PyReadonlyArray2<'py, f32>,
+        ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+            if b.as_array().nrows() != self.m {
+                return Err(PyValueError::new_err("B must have m rows"));
+            }
+            let b = b.as_array();
+            Ok(self.run(py, || csc_matmul(&self.csc, self.n, b)).into_pyarray(py))
+        }
+    }
 
     /// Low-level KL-NMF entry point. Use `metagene.nmf` instead.
     ///
@@ -76,15 +211,7 @@ mod metagene {
             verbose,
         };
 
-        let pool = match n_threads {
-            Some(n_threads) => Some(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(n_threads)
-                    .build()
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
-            ),
-            None => None,
-        };
+        let pool = thread_pool(n_threads)?;
 
         let result = py.detach(|| {
             let x = CSR {

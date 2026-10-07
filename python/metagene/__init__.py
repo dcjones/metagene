@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import scipy.sparse as sp
 
-from .metagene import _nmf
+from .metagene import _nmf, _SparseMatrix
 
 __all__ = ["nmf", "NMFResult"]
 
@@ -47,19 +47,22 @@ def _as_u32(a: np.ndarray) -> np.ndarray:
     return a.astype(np.uint32)
 
 
-def _randomized_svd(X, k, rng, n_oversamples=10, n_iter=4):
+def _randomized_svd(X, k, rng, n_oversamples=10, n_iter=4, n_threads=None):
     """Rank-k truncated SVD (U [m, k], S [k], Vt [k, n]) of a sparse [m, n] matrix, by a randomized
     range finder with power iterations (Halko, Martinsson & Tropp 2011, algorithm 4.4).
 
     The range finder works on the gene side (n ≪ m), so the orthonormalizations are of [n, l]
     matrices and only the products with X scale with m. The left singular vectors then come from the
     eigendecomposition of the small Gram matrix of X V, which is accurate enough for initialization.
+    X must be a canonical CSR matrix; the products with it run in parallel in Rust.
     """
     l = min(k + n_oversamples, *X.shape)
+    data = np.ascontiguousarray(X.data, dtype=np.float32)
+    A = _SparseMatrix(data, _as_u32(X.indices), _as_u32(X.indptr), X.shape[1], l, n_threads)
     V = rng.standard_normal((X.shape[1], l), dtype=np.float32)  # [n, l]
     for _ in range(n_iter + 1):
-        V, _ = np.linalg.qr(X.T @ (X @ V))
-    XV = X @ V  # [m, l]
+        V, _ = np.linalg.qr(A.rmatmul(A.matmul(V)))
+    XV = A.matmul(V)  # [m, l]
     λ, E = np.linalg.eigh(XV.T.astype(np.float64) @ XV)  # XV = U S Eᵀ, ascending
     λ, E = λ[::-1][:k], E[:, ::-1][:, :k]
     S = np.sqrt(np.maximum(λ, 0.0))
@@ -67,13 +70,13 @@ def _randomized_svd(X, k, rng, n_oversamples=10, n_iter=4):
     return U, S, (V @ E.astype(np.float32)).T
 
 
-def _nndsvd(X, k, rng):
+def _nndsvd(X, k, rng, n_threads=None):
     """NNDSVD initialization (Boutsidis & Gallopoulos 2008), with zeros raised to the solver's floor.
 
     Each singular triplet's sign is chosen so its positive (or negative) parts carry the most mass,
     which are then used as a nonnegative factor pair.
     """
-    U, S, Vt = _randomized_svd(X, k, rng)
+    U, S, Vt = _randomized_svd(X, k, rng, n_threads=n_threads)
     V = Vt.T
     Up, Un = np.maximum(U, 0), np.maximum(-U, 0)
     Vp, Vn = np.maximum(V, 0), np.maximum(-V, 0)
@@ -216,9 +219,9 @@ def nmf(
         H0 = scale * rng.random((k, n), dtype=np.float32)
     elif W0 is None and warm_start:
         W0 = flat_W()
-        W0[idx], H0 = _nndsvd(X_sub, k, rng)
+        W0[idx], H0 = _nndsvd(X_sub, k, rng, n_threads)
     elif W0 is None:
-        W0, H0 = _nndsvd(X, k, rng)
+        W0, H0 = _nndsvd(X, k, rng, n_threads)
     W0, H0 = np.asarray(W0), np.asarray(H0)
     if W0.shape != (m, k) or H0.shape != (k, n):
         raise ValueError(f"expected W0 {(m, k)} and H0 {(k, n)}, got {W0.shape} and {H0.shape}")

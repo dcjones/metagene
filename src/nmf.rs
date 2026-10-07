@@ -7,20 +7,20 @@ use std::time::{Duration, Instant};
 // Maximum number of rows (or columns) per rayon task. Per-row work varies a lot (cells differ in
 // depth, genes in detection rate) and inputs are often ordered in ways that cluster heavy rows, so
 // without this rayon's default ~1 chunk per thread can leave most threads idle.
-const PAR_GRAIN: usize = 4;
+pub(crate) const PAR_GRAIN: usize = 4;
 
 // Target size of the slice of W touched by one cell block in the H pass. Every thread works on the
 // same block at once, so this should fit comfortably in (shared) L3. Tuned on a Ryzen 9 5950X
 // (2 × 32MB L3); 4–16MB all perform similarly.
-const H_PASS_BLOCK_BYTES: usize = 8 << 20;
+pub(crate) const H_PASS_BLOCK_BYTES: usize = 8 << 20;
 
 // How many nonzeros ahead to prefetch the gathered factor row. Helps mainly when SMT isn't already
 // hiding the latency.
-const PREFETCH_DISTANCE: usize = 2;
+pub(crate) const PREFETCH_DISTANCE: usize = 2;
 
 // Nonzeros processed together in the inner loops, so their dependency chains (gather, dot product,
 // division, axpy) overlap, the shared row is loaded once, and the accumulator row is updated once.
-const NNZ_BLOCK: usize = 2;
+pub(crate) const NNZ_BLOCK: usize = 2;
 
 pub struct NMFOptions {
     // maximum number of iterations
@@ -81,7 +81,7 @@ pub struct CSR<'a> {
 }
 
 impl CSR<'_> {
-    fn slices(&self) -> (&[f32], &[u32], &[u32]) {
+    pub(crate) fn slices(&self) -> (&[f32], &[u32], &[u32]) {
         (
             self.data.as_slice().expect("data must be contiguous"),
             self.indices.as_slice().expect("indices must be contiguous"),
@@ -277,10 +277,10 @@ fn col_sum_f64(a: ArrayView2<f32>) -> Array1<f64> {
 }
 
 // Transposed (CSC) copy of a contiguous block of rows of X. Row indices are global.
-struct CSC {
-    data: Vec<f32>,
-    indices: Vec<u32>, // row (cell) indices
-    indptr: Vec<usize>,
+pub(crate) struct CSC {
+    pub(crate) data: Vec<f32>,
+    pub(crate) indices: Vec<u32>, // row (cell) indices
+    pub(crate) indptr: Vec<usize>,
 }
 
 impl CSC {
@@ -319,12 +319,12 @@ impl CSC {
 
 // CSC copy of X split into blocks of cells, so H can be updated in a column-parallel pass where each
 // thread owns the rows of H it writes, while the rows of W being gathered stay in cache.
-struct BlockedCSC {
-    blocks: Vec<CSC>,
+pub(crate) struct BlockedCSC {
+    pub(crate) blocks: Vec<CSC>,
 }
 
 impl BlockedCSC {
-    fn from_csr(x: &CSR, n: usize, block_rows: usize) -> Self {
+    pub(crate) fn from_csr(x: &CSR, n: usize, block_rows: usize) -> Self {
         let m = x.indptr.len() - 1;
         let blocks = (0..m.div_ceil(block_rows).max(1))
             .into_par_iter()
