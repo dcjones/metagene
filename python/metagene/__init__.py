@@ -18,11 +18,14 @@ class NMFResult:
     H: np.ndarray  # [k, n]
     loss: list = field(default_factory=list)  # (iteration, elapsed seconds, kl) tuples
     n_iter: int = 0
-    warm_start_time: float = 0.0  # seconds spent on the warm start, included in loss times
+    init_time: float = 0.0  # seconds spent on NNDSVD and the warm start, included in loss times
 
 
 # The warm start is enabled automatically when the subsample would have at least this many cells.
 WARM_START_MIN_CELLS = 20_000
+
+# The solver's floor on factor values (EPS in src/nmf.rs).
+EPS = 1e-6
 
 
 def _as_csr(X) -> sp.csr_matrix:
@@ -44,6 +47,50 @@ def _as_u32(a: np.ndarray) -> np.ndarray:
     return a.astype(np.uint32)
 
 
+def _randomized_svd(X, k, rng, n_oversamples=10, n_iter=4):
+    """Rank-k truncated SVD (U [m, k], S [k], Vt [k, n]) of a sparse [m, n] matrix, by a randomized
+    range finder with power iterations (Halko, Martinsson & Tropp 2011, algorithm 4.4).
+
+    The range finder works on the gene side (n ≪ m), so the orthonormalizations are of [n, l]
+    matrices and only the products with X scale with m. The left singular vectors then come from the
+    eigendecomposition of the small Gram matrix of X V, which is accurate enough for initialization.
+    """
+    l = min(k + n_oversamples, *X.shape)
+    V = rng.standard_normal((X.shape[1], l), dtype=np.float32)  # [n, l]
+    for _ in range(n_iter + 1):
+        V, _ = np.linalg.qr(X.T @ (X @ V))
+    XV = X @ V  # [m, l]
+    λ, E = np.linalg.eigh(XV.T.astype(np.float64) @ XV)  # XV = U S Eᵀ, ascending
+    λ, E = λ[::-1][:k], E[:, ::-1][:, :k]
+    S = np.sqrt(np.maximum(λ, 0.0))
+    U = (XV @ E.astype(np.float32)) / np.maximum(S, 1e-30).astype(np.float32)
+    return U, S, (V @ E.astype(np.float32)).T
+
+
+def _nndsvd(X, k, rng):
+    """NNDSVD initialization (Boutsidis & Gallopoulos 2008), with zeros raised to the solver's floor.
+
+    Each singular triplet's sign is chosen so its positive (or negative) parts carry the most mass,
+    which are then used as a nonnegative factor pair.
+    """
+    U, S, Vt = _randomized_svd(X, k, rng)
+    V = Vt.T
+    Up, Un = np.maximum(U, 0), np.maximum(-U, 0)
+    Vp, Vn = np.maximum(V, 0), np.maximum(-V, 0)
+    upn, vpn = np.linalg.norm(Up, axis=0), np.linalg.norm(Vp, axis=0)
+    unn, vnn = np.linalg.norm(Un, axis=0), np.linalg.norm(Vn, axis=0)
+    pos = upn * vpn >= unn * vnn
+    pos[0] = True  # the leading pair is single-signed; abs() below guards against round-off
+    Up[:, 0], Vp[:, 0] = np.abs(U[:, 0]), np.abs(V[:, 0])
+    upn[0], vpn[0] = 1.0, 1.0
+    u = np.where(pos, Up / np.maximum(upn, 1e-30), Un / np.maximum(unn, 1e-30))
+    v = np.where(pos, Vp / np.maximum(vpn, 1e-30), Vn / np.maximum(vnn, 1e-30))
+    scale = np.sqrt(S * np.where(pos, upn * vpn, unn * vnn))
+    W = np.maximum(u * scale, EPS).astype(np.float32)
+    H = np.maximum(v * scale, EPS).astype(np.float32).T
+    return W, H
+
+
 def _fit(X, w, ht, *, max_iter, tol, eval_every, verbose, n_threads, max_time, method, restart, fit_H):
     """Run the Rust solver on a canonical CSR matrix. Returns (w, ht, loss, n_iter)."""
     data = np.ascontiguousarray(X.data, dtype=np.float32)
@@ -58,6 +105,7 @@ def nmf(
     k: int,
     *,
     method: str = "bmme",
+    init: str = "nndsvd",
     restart: bool = False,
     fit_H: bool = True,
     warm_start: bool | None = None,
@@ -92,6 +140,13 @@ def nmf(
         updates. BMMe costs the same per iteration and typically needs 2-4x fewer iterations to
         reach a given objective. Its objective isn't guaranteed to be monotone, and evaluating it
         costs an extra pass over the data (so about 1/eval_every extra W-pass work).
+    init : {"nndsvd", "random"}
+        How to initialize the factors when W0 and H0 aren't given: NNDSVD (Boutsidis & Gallopoulos
+        2008, from a randomized truncated SVD of X, or of the warm start's subsample), or uniformly
+        random. NNDSVD costs an SVD up front, but finds substantially better solutions when k is a
+        sizable fraction of the number of genes n (e.g. k=100 on a few-hundred-gene panel), where
+        random starts tend to settle in worse local minima. With n much larger than k they reach
+        similar solutions. Its time counts toward max_time and is included in loss times.
     restart : bool
         With method="bmme", reset the extrapolation whenever an evaluated objective increases.
     fit_H : bool
@@ -113,9 +168,10 @@ def nmf(
     eval_every : int
         Compute the KL divergence every this many iterations (0 disables it, and early stopping).
     W0, H0 : arrays of shape [m, k] and [k, n], optional
-        Initial factors. Both or neither must be given. Random if omitted.
+        Initial factors. Both or neither must be given (except H0 alone with fit_H=False).
+        Chosen according to init if omitted.
     seed : int, optional
-        Seed for random initialization and the warm start's subsample.
+        Seed for random initialization, the randomized SVD, and the warm start's subsample.
     n_threads : int, optional
         Number of threads. Defaults to rayon's global pool (all cores, or RAYON_NUM_THREADS).
     verbose : bool
@@ -123,6 +179,8 @@ def nmf(
     """
     if method not in ("mu", "bmme"):
         raise ValueError(f"unknown method {method!r}")
+    if init not in ("nndsvd", "random"):
+        raise ValueError(f"unknown init {init!r}")
     X = _as_csr(X)
     m, n = X.shape
 
@@ -141,17 +199,27 @@ def nmf(
     rng = np.random.default_rng(seed)
     if not fit_H and H0 is None:
         raise ValueError("fit_H=False requires H0")
-    if W0 is None and H0 is not None and not fit_H:
-        W0 = np.full((m, k), np.sqrt(total / (m * n) / k), dtype=np.float32)
-    if (W0 is None) != (H0 is None):
+    if (W0 is None) != (H0 is None) and fit_H:
         raise ValueError("W0 and H0 must be given together")
-    if W0 is None:
+    t0 = time.perf_counter()
+    if warm_start:
+        idx = np.sort(rng.choice(m, n_sub, replace=False))
+        X_sub = X[idx]
+    # Rows of W without an initial value start from a constant, and are first fit with H fixed.
+    flat_W = lambda: np.full((m, k), np.sqrt(total / (m * n) / k), dtype=np.float32)  # noqa: E731
+    if W0 is None and H0 is not None:
+        W0 = flat_W()
+    elif W0 is None and init == "random":
         # Uniform init scaled so that E[(W H)_ij] = mean(X).
         scale = np.sqrt(4.0 * total / (m * n) / k)
         W0 = scale * rng.random((m, k), dtype=np.float32)
         H0 = scale * rng.random((k, n), dtype=np.float32)
-    W0 = np.asarray(W0)
-    H0 = np.asarray(H0)
+    elif W0 is None and warm_start:
+        W0 = flat_W()
+        W0[idx], H0 = _nndsvd(X_sub, k, rng)
+    elif W0 is None:
+        W0, H0 = _nndsvd(X, k, rng)
+    W0, H0 = np.asarray(W0), np.asarray(H0)
     if W0.shape != (m, k) or H0.shape != (k, n):
         raise ValueError(f"expected W0 {(m, k)} and H0 {(k, n)}, got {W0.shape} and {H0.shape}")
 
@@ -159,12 +227,9 @@ def nmf(
     ht = np.ascontiguousarray(H0.T, dtype=np.float32)
     opts = dict(verbose=verbose, n_threads=n_threads, method=method, restart=restart)
 
-    warm_start_time = 0.0
     if warm_start:
-        t0 = time.perf_counter()
-        idx = np.sort(rng.choice(m, n_sub, replace=False))
         w_sub, ht, _, _ = _fit(
-            X[idx], w[idx], ht, max_iter=warm_start_iter, tol=-np.inf, eval_every=0,
+            X_sub, w[idx], ht, max_iter=warm_start_iter, tol=-np.inf, eval_every=0,
             max_time=None, fit_H=True, **opts,
         )
         w[idx] = w_sub
@@ -172,15 +237,15 @@ def nmf(
             X, w, ht, max_iter=warm_start_w_passes, tol=-np.inf, eval_every=0,
             max_time=None, fit_H=False, **opts,
         )
-        warm_start_time = time.perf_counter() - t0
-        if verbose:
-            print(f"warm start: {warm_start_time:.2f}s", file=sys.stderr)
-        if max_time is not None:
-            max_time = max(max_time - warm_start_time, 0.0)
+    init_time = time.perf_counter() - t0
+    if verbose and init_time > 0.1:
+        print(f"initialization: {init_time:.2f}s", file=sys.stderr)
+    if max_time is not None:
+        max_time = max(max_time - init_time, 0.0)
 
     w, ht, loss, n_iter = _fit(
         X, w, ht, max_iter=max_iter, tol=tol, eval_every=eval_every, max_time=max_time,
         fit_H=fit_H, **opts,
     )
-    loss = [(i, t + warm_start_time, l) for i, t, l in loss]
-    return NMFResult(W=w, H=ht.T, loss=loss, n_iter=n_iter, warm_start_time=warm_start_time)
+    loss = [(i, t + init_time, l) for i, t, l in loss]
+    return NMFResult(W=w, H=ht.T, loss=loss, n_iter=n_iter, init_time=init_time)

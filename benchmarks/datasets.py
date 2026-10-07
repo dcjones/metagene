@@ -11,16 +11,20 @@ import scipy.sparse as sp
 
 
 def read_10x_h5(path) -> sp.csr_matrix:
-    """10x Cell Ranger filtered_feature_bc_matrix.h5 (stored genes × cells CSC)."""
+    """10x Cell Ranger filtered_feature_bc_matrix.h5 or Xenium cell_feature_matrix.h5 (stored
+    features × cells CSC). Only "Gene Expression" features are kept, dropping e.g. Xenium's
+    control probes and codewords."""
     import h5py
 
     with h5py.File(path) as f:
         g = f["matrix"]
-        ngenes, ncells = g["shape"][:]
-        return sp.csr_matrix(
+        nfeatures, ncells = g["shape"][:]
+        X = sp.csr_matrix(
             (g["data"][:].astype(np.float32), g["indices"][:], g["indptr"][:]),
-            shape=(ncells, ngenes),
+            shape=(ncells, nfeatures),
         )
+        genes = g["features"]["feature_type"][:] == b"Gene Expression"
+    return X if genes.all() else sp.csr_matrix(X[:, np.nonzero(genes)[0]])
 
 
 def read_anndata_zarr(path, ncells=None) -> sp.csr_matrix:

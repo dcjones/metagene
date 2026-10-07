@@ -118,7 +118,8 @@ def test_matches_reference_bmme():
 @pytest.mark.parametrize("restart", [False, True])
 def test_bmme_loss_is_evaluated_at_iterates(restart):
     X = random_counts()
-    res = metagene.nmf(X, 4, method="bmme", restart=restart, max_iter=50, tol=-np.inf, eval_every=1, seed=1)
+    res = metagene.nmf(X, 4, method="bmme", init="random", restart=restart, max_iter=50, tol=-np.inf,
+                       eval_every=1, seed=1)
     final = res.loss[-1][2]
     assert final == pytest.approx(kl(X, res.W, res.H), rel=1e-4)
     assert final < 0.5 * res.loss[0][2]
@@ -147,19 +148,47 @@ def test_fixed_H_without_W0():
     assert proj.loss[-1][2] <= fit.loss[-1][2] * (1 + 1e-3)
 
 
-def test_warm_start():
+@pytest.mark.parametrize("init", ["nndsvd", "random"])
+def test_warm_start(init):
     X = random_counts(m=600)
-    res = metagene.nmf(X, 4, warm_start=True, warm_start_fraction=0.2, max_iter=50, tol=-np.inf,
-                       eval_every=1, seed=0)
-    assert res.warm_start_time > 0
-    assert res.loss[0][1] >= res.warm_start_time
+    res = metagene.nmf(X, 4, init=init, warm_start=True, warm_start_fraction=0.2, max_iter=50,
+                       tol=-np.inf, eval_every=1, seed=0)
+    assert res.init_time > 0
+    assert res.loss[0][1] >= res.init_time
     assert res.loss[-1][2] == pytest.approx(kl(X, res.W, res.H), rel=1e-4)
-    cold = metagene.nmf(X, 4, warm_start=False, max_iter=50, tol=-np.inf, eval_every=1, seed=0)
+    cold = metagene.nmf(X, 4, init=init, warm_start=False, max_iter=50, tol=-np.inf, eval_every=1, seed=0)
     assert res.loss[0][2] < cold.loss[0][2]
 
 
 def test_warm_start_auto():
     X = random_counts()
-    assert metagene.nmf(X, 4, max_iter=5, seed=0).warm_start_time == 0
+    auto = metagene.nmf(X, 4, max_iter=5, seed=0, n_threads=1)
+    cold = metagene.nmf(X, 4, max_iter=5, seed=0, n_threads=1, warm_start=False)
+    np.testing.assert_array_equal(auto.W, cold.W)
     with pytest.raises(ValueError):
         metagene.nmf(X, 4, warm_start=True, warm_start_fraction=0.001, max_iter=5, seed=0)
+
+
+def test_randomized_svd():
+    X = random_counts()
+    U, S, Vt = metagene._randomized_svd(X, 4, np.random.default_rng(0))
+    S_ref = np.linalg.svd(X.toarray().astype(np.float64), compute_uv=False)[:4]
+    np.testing.assert_allclose(S, S_ref, rtol=1e-3)
+    np.testing.assert_allclose(U.T @ U, np.eye(4), atol=1e-4)
+    np.testing.assert_allclose((U * S) @ Vt, U @ (U.T @ X.toarray()), rtol=1e-3, atol=1e-2)
+
+
+def test_nndsvd_init():
+    X = random_counts()
+    W0, H0 = metagene._nndsvd(X, 4, np.random.default_rng(0))
+    assert W0.shape == (300, 4) and H0.shape == (4, 100)
+    assert (W0 >= metagene.EPS).all() and (H0 >= metagene.EPS).all()
+    # a better starting point than the random init
+    a = metagene.nmf(X, 4, init="nndsvd", max_iter=1, tol=-np.inf, eval_every=1, seed=0)
+    b = metagene.nmf(X, 4, init="random", max_iter=1, tol=-np.inf, eval_every=1, seed=0)
+    assert a.loss[0][2] < 0.5 * b.loss[0][2]
+    # and reproducible given a seed
+    c = metagene.nmf(X, 4, init="nndsvd", max_iter=1, tol=-np.inf, eval_every=1, seed=0)
+    np.testing.assert_array_equal(a.W, c.W)
+    with pytest.raises(ValueError):
+        metagene.nmf(X, 4, init="nndsvda")

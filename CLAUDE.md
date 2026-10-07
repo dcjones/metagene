@@ -56,6 +56,16 @@ Each iteration is a W pass then an H pass (alternating multiplicative updates). 
   subsample would have ≥ 20k cells. 2–4× faster to a given objective on 250k and 660k cells; useless
   on ~10k cells. Tuned on 250k cells and checked at 660k: smaller subsamples (or a fixed cap) were
   worse.
+- **Initialization** (Python side): NNDSVD by default (`init="nndsvd"`), of the warm start's
+  subsample when there is one (other W rows start constant). Random init lands in worse local
+  minima when k is a large fraction of n: at k=100 with warm start, random ended 2–7% worse on a
+  377-gene Xenium panel, 0.4–1.4% on 477 genes, ~1e-3 on 5k genes, 1.5–5e-4 on Atera (18k genes);
+  NNDSVD was never worse. Without warm start, scRNA (18k genes) showed no difference, while the
+  same cells restricted to their top 380 genes reproduced the gap — it's k/n, not the platform. At
+  k=20 on 380 genes the inits were equivalent. sklearn's default nndsvda (zeros filled with the
+  mean) was as bad as random; nndsvdar ≈ nndsvd. The randomized SVD runs the range finder on the
+  gene side (QRs are [n, l]; a tall [m, l] QR was ~1 s each) and costs ~3 s on a 40k × 5k
+  subsample, ~13 s on a 66k × 18k one (scipy's single-threaded sparse products dominate).
 - **Kernels:** explicit AVX2+FMA intrinsics, chosen at runtime (`Isa::detect`, override with
   `METAGENE_SIMD=portable`). Per-row loop bodies are generic over `const AVX2: bool` and run via
   `dispatch!` inside a `#[target_feature]` wrapper so the whole loop is compiled for AVX2. LLVM did

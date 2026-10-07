@@ -39,15 +39,22 @@ import metagene  # noqa: E402
 sys.path.insert(0, str(Path(__file__).parent))
 from datasets import load  # noqa: E402
 
-# Each method is called as f(X, k, W0, H0, max_iter, max_time, n_threads, eval_every) and returns
+# Each method is called as f(X, k, W0, H0, max_iter, max_time, n_threads, eval_every, seed) and returns
 # a metagene.NMFResult whose loss records are (iteration, elapsed seconds, kl). Any work a method
 # does before calling metagene.nmf (e.g. fitting a subsample) must be included in those times.
+# Methods that set `init` compute their own initialization (seeded by the run's seed) and ignore
+# the shared W0, H0.
 def _metagene(**kw):
     kw.setdefault("warm_start", False)
-    return lambda X, k, W0, H0, max_iter, max_time, n_threads, eval_every: metagene.nmf(
-        X, k, W0=W0, H0=H0, max_iter=max_iter, max_time=max_time,
-        tol=-np.inf, eval_every=eval_every, n_threads=n_threads, **kw,
-    )
+
+    def run(X, k, W0, H0, max_iter, max_time, n_threads, eval_every, seed):
+        if "init" in kw:
+            W0 = H0 = None
+        return metagene.nmf(
+            X, k, W0=W0, H0=H0, max_iter=max_iter, max_time=max_time, tol=-np.inf,
+            eval_every=eval_every, n_threads=n_threads, **{"seed": seed, **kw},
+        )
+    return run
 
 
 METHODS = {
@@ -55,6 +62,8 @@ METHODS = {
     "bmme": _metagene(method="bmme"),
     "bmme-restart": _metagene(method="bmme", restart=True),
     "bmme-warm": _metagene(method="bmme", warm_start=True, seed=0),
+    "bmme-nndsvd": _metagene(method="bmme", init="nndsvd"),
+    "bmme-warm-nndsvd": _metagene(method="bmme", init="nndsvd", warm_start=True),
 }
 
 REF = "ref"
@@ -120,11 +129,11 @@ def cmd_run(args):
         W0, H0 = init_factors(X, args.k, seed)
         if args.ref_iters:
             res = get_method(args.ref_method)(
-                X, args.k, W0, H0, args.ref_iters, None, args.threads, max(args.ref_iters // 1000, 1)
+                X, args.k, W0, H0, args.ref_iters, None, args.threads, max(args.ref_iters // 1000, 1), seed
             )
             save(args.ref_name, seed, res)
         for name in args.methods:
-            res = get_method(name)(X, args.k, W0, H0, args.max_iter, args.max_time, args.threads, args.eval_every)
+            res = get_method(name)(X, args.k, W0, H0, args.max_iter, args.max_time, args.threads, args.eval_every, seed)
             save(name, seed, res)
 
     report(out, args.plot)
