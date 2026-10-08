@@ -9,12 +9,14 @@ Both are scored against the rank-1 null model μ_ij = r_i c_j / T (cell depth ×
 Fits are rerun from the same (deterministic, NNDSVD) initialization for each iteration count in
 --iters, so the test deviance can be followed along the optimization path. metagene.nmf's default
 warm start applies (it's only used from 200k cells). Variants of the solver are given as
-comma-separated settings on top of plain KL-NMF (`base`, i.e. no prior on H):
+comma-separated settings on top of plain full-batch KL-NMF (`base`: BMMe with no prior on H, so
+results stay comparable with runs from before minibatch training became metagene's default):
 
+    method=minibatch    solver method (metagene's default; "base" is method=bmme)
     eps=1e-3        floor on factor values
     a=0.1           flat Gamma prior on H with this pseudocount (h_pseudocount), default rate
     a=0.1,b=2       ... and rate (h_rate)
-    gr=0.1          gene-rate prior with this pseudocount (metagene's default is gr=1)
+    gr=0.1          gene-rate prior with this pseudocount (gr=1 is a good strength)
 
     python benchmarks/heldout.py run DATA --ncells 500 2500 9503 --k 25 100 \\
         --variants base eps=1e-2 a=0.1 --out results/ho
@@ -52,6 +54,7 @@ VARIANT_KEYS = {
     "a": ("h_pseudocount", {"h_prior": "flat"}),
     "b": ("h_rate", {}),
     "gr": ("h_pseudocount", {"h_prior": "gene-rate"}),
+    "method": ("method", {}),
 }
 
 # Gene total count bins (in the full, unsplit matrix) for the per-gene breakdown.
@@ -62,7 +65,7 @@ COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a
 
 
 def parse_variant(spec):
-    kw = {"h_pseudocount": 0.0}
+    kw = {"h_pseudocount": 0.0, "method": "bmme"}
     if spec == "base":
         return kw
     for setting in spec.split(","):
@@ -70,7 +73,7 @@ def parse_variant(spec):
         if key not in VARIANT_KEYS:
             raise ValueError(f"unknown variant setting {key!r} in {spec!r}")
         name, extra = VARIANT_KEYS[key]
-        kw[name] = float(value)
+        kw[name] = value if name == "method" else float(value)
         kw.update(extra)
     return kw
 

@@ -104,7 +104,7 @@ def _fit(X, w, ht, *, max_iter, tol, eval_every, verbose, n_threads, max_time, m
     return _nmf(
         data, _as_u32(X.indices), _as_u32(X.indptr), w, ht, max_iter, tol, eval_every, verbose,
         n_threads, max_time, method == "bmme", restart, fit_H, eps, h_shape, h_rate,
-        *(batch or (None, 1000, 0.1, 1, 0, 0)),
+        *(batch or (None, 1000, [(0, 0.1)], 1, 0, 0)),
     )
 
 
@@ -112,15 +112,15 @@ def nmf(
     X,
     k: int,
     *,
-    method: str = "bmme",
+    method: str = "minibatch",
     batch_size: int = 1000,
-    batch_step: float = 0.1,
+    batch_step: float | list[tuple[int, float]] = ((0, 1.0), (150, 0.1)),
     batch_w_steps: int = 1,
     batch_final_w_passes: int = 5,
     init: str = "nndsvd",
     restart: bool = False,
     fit_H: bool = True,
-    h_pseudocount: float = 1.0,
+    h_pseudocount: float = 0.0,
     h_rate: float | None = None,
     h_prior: str = "gene-rate",
     eps: float = EPS,
@@ -140,6 +140,11 @@ def nmf(
 ) -> NMFResult:
     """KL-NMF of a non-negative [m, n] matrix X ≈ W H, using multiplicative updates.
 
+    By default it's trained with minibatches of cells, by stochastic majorization-minimization:
+
+        Mairal, J. (2013) Stochastic majorization-minimization algorithms for large-scale
+        optimization. Advances in Neural Information Processing Systems 26.
+
     With method="bmme", each factor is extrapolated before its multiplicative update, following
 
         Hien, L.T.K., Leplat, V. and Gillis, N. (2025) Block Majorization Minimization with
@@ -151,19 +156,25 @@ def nmf(
         Count matrix, typically cells × genes. Converted to CSR float32.
     k : int
         Number of factors.
-    method : {"bmme", "mu", "minibatch"}
-        Multiplicative updates with extrapolation (BMMe, the default), or plain multiplicative
-        updates. BMMe costs the same per iteration and typically needs 2-4x fewer iterations to
-        reach a given objective. Its objective isn't guaranteed to be monotone, and evaluating it
-        costs an extra pass over the data (so about 1/eval_every extra W-pass work).
-        With "minibatch", each iteration is an epoch over minibatches of batch_size cells
-        (a random partition of the cells, visited in a random order each epoch): a batch's rows of
-        W get batch_w_steps multiplicative updates, then H takes a step on a running average of
-        its majorizer (stochastic MM, Mairal 2013), in which the newest batch has weight at least
-        batch_step. A smaller batch_step averages over more batches (about 1 / batch_step), and a
-        larger one makes H follow each batch more closely. The fit ends with
-        batch_final_w_passes W-only passes, so every cell's W is fit to the final H. The warm start
-        isn't used by default.
+    method : {"minibatch", "bmme", "mu"}
+        With "minibatch" (the default), each iteration is an epoch over minibatches of batch_size
+        cells (a random partition of the cells, visited in a random order each epoch): a batch's
+        rows of W get batch_w_steps multiplicative updates, then H takes a step on a running
+        average of its majorizer, in which the newest batch has weight at least batch_step. The
+        full-batch methods fit the training objective better, but tend to dedicate factors to
+        small groups of unusual cells (e.g. a tail of very deep cells), which minibatch training
+        largely avoids. "bmme" and "mu" are full-batch multiplicative updates with extrapolation
+        (BMMe) or without. BMMe costs the same per iteration and typically needs 2-4x fewer
+        iterations to reach a given objective. Neither BMMe's nor minibatch training's objective is
+        guaranteed to be monotone, and evaluating them costs an extra pass over the data (so about
+        1/eval_every extra W-pass work).
+        For "minibatch": batch_step. A smaller batch_step averages over more batches (about 1 / batch_step), and a
+        larger one makes H follow each batch more closely. batch_step can also be a schedule of
+        (first epoch, step) pairs, starting at epoch 0; by default the step is 1 (each H step
+        uses only the newest batch) for 150 epochs, then 0.1, so max_iter should be well past 150.
+        Convergence (tol) is only checked once the last step in the schedule is reached. The fit
+        ends with batch_final_w_passes W-only passes (if any epochs ran), so every cell's W is fit
+        to the final H. The warm start isn't used by default.
     init : {"nndsvd", "random"}
         How to initialize the factors when W0 and H0 aren't given: NNDSVD (Boutsidis & Gallopoulos
         2008, from a randomized truncated SVD of X, or of the warm start's subsample), or uniformly
@@ -181,8 +192,10 @@ def nmf(
         becomes (h_kj Σ_i w_ik x_ij / (W H)_ij + a_j) / (Σ_i w_ik + b_j), and the reported
         objective adds Σ_kj b_j h_kj - a_j log h_kj. Without it, fits overfit the noise when there
         are few cells per gene: rarely seen genes get near-zero loadings, which predict near-zero
-        means for counts not seen in training. By default every gene gets h_pseudocount = 1
-        pseudocount per factor (a_j = h_pseudocount), and with h_prior="gene-rate" the rate is
+        means for counts not seen in training. It's off by default (h_pseudocount = 0): minibatch
+        training's own regularization was preferred overall, though the prior does improve
+        held-out deviance. Given h_pseudocount, every gene gets that many pseudocounts per
+        factor (a_j = h_pseudocount), and with h_prior="gene-rate" the rate is
         b_j = h_rate / f_j, where f_j = (c_j + 1) / mean(c + 1) is gene j's frequency from its total
         count c_j in X. The prior's mode is then proportional to gene frequency, so loadings the
         data doesn't support shrink towards the rank-1 (depth × frequency) model, and factors the
@@ -191,7 +204,7 @@ def nmf(
         over-predicts rare genes and prunes many more factors. Since W H is unchanged by rescaling
         W and H in opposite directions, h_rate only sets the scale of H; by default it's
         h_pseudocount / mean(H0), keeping H at its initial scale. The strength is set by
-        h_pseudocount (0 disables the prior and gives plain KL-NMF).
+        h_pseudocount (0 disables the prior and gives plain KL-NMF; 1 is a good choice).
     eps : float
         Floor on factor values, applied after each update.
     warm_start : bool, optional
@@ -199,8 +212,8 @@ def nmf(
         warm_start_fraction of the rows), then fitting W for all cells with that H held fixed
         (warm_start_w_passes iterations), before fitting everything. This is much cheaper than full
         iterations and substantially speeds up convergence on large datasets. By default it's used
-        when no initial factors are given and the subsample would have at least
-        WARM_START_MIN_CELLS cells. Its time counts toward max_time and is included in loss times.
+        with the full-batch methods when no initial factors are given and the subsample would have
+        at least WARM_START_MIN_CELLS cells. Its time counts toward max_time and is included in loss times.
     max_iter : int
         Maximum number of iterations.
     max_time : float, optional
@@ -213,7 +226,9 @@ def nmf(
         Initial factors. Both or neither must be given (except H0 alone with fit_H=False).
         Chosen according to init if omitted.
     seed : int, optional
-        Seed for random initialization, the randomized SVD, and the warm start's subsample.
+        Seed for random initialization, the randomized SVD, the warm start's subsample, and the
+        minibatches. With the default method, results vary between runs unless it's given, even
+        with W0 and H0.
     n_threads : int, optional
         Number of threads. Defaults to rayon's global pool (all cores, or RAYON_NUM_THREADS).
     verbose : bool
@@ -303,10 +318,14 @@ def nmf(
 
     batch = None
     if method == "minibatch" and fit_H:
-        if batch_size < 1 or not 0 < batch_step <= 1 or batch_w_steps < 0:
+        steps = [(0, batch_step)] if np.isscalar(batch_step) else batch_step
+        steps = [(int(e), float(s)) for e, s in steps]
+        if not steps or steps[0][0] != 0 or any(e1 <= e0 for (e0, _), (e1, _) in zip(steps, steps[1:])):
+            raise ValueError("batch_step schedule must start at epoch 0, with increasing epochs")
+        if batch_size < 1 or not all(0 < s <= 1 for _, s in steps) or batch_w_steps < 0:
             raise ValueError("need batch_size >= 1, 0 < batch_step <= 1, batch_w_steps >= 0")
         perm = rng.permutation(m).astype(np.uint32)
-        batch = (perm, batch_size, batch_step, batch_w_steps, batch_final_w_passes,
+        batch = (perm, batch_size, steps, batch_w_steps, batch_final_w_passes,
                  int(rng.integers(2**63)))
     w, ht, loss, n_iter = _fit(
         X, w, ht, max_iter=max_iter, tol=tol, eval_every=eval_every, max_time=max_time,

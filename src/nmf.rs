@@ -59,26 +59,31 @@ pub struct NMFOptions {
     pub verbose: bool,
 }
 
-// Minibatch training (stochastic majorization-minimization; Mairal 2013, SIAM J. Optim. 25:829).
+// Minibatch training (stochastic majorization-minimization; Mairal 2013, NeurIPS 26).
 // Each iteration is one epoch: the minibatches are visited in a random order, and for each, its rows
 // of W get `w_steps` multiplicative updates, then H takes a step on a running average of its
 // majorizer. H's majorizer at H̃ is Σ_jk b_j h_jk - (h̃_jk ρh_jk + a_j) ln h_jk + h_jk Σ_i w_ik, so
 // the average only needs A [n, k] (of h̃_jk ρh_jk) and B [k] (of Σ_i w_ik), each scaled by m / |batch|
-// to estimate the full-data sum. With weight λ_t = max(λ, 1 / t) on step t's batch,
+// to estimate the full-data sum. With weight λ_t = max(λ, 1 / t) on step t's batch (t counting
+// from where λ last changed in its schedule),
 //
 //     A ← (1 - λ_t) A + λ_t m/|b| h̃ ρh_b,   B ← (1 - λ_t) B + λ_t m/|b| Σ_{i∈b} w_i,
 //     h_jk ← (A_jk + a_j) / (B_k + b_j).
 //
-// A single batch with λ = 1 is the full-batch update. Smaller λ averages over more batches.
+// A single batch with λ = 1 is the full-batch update. Smaller λ averages over more batches. λ = 1
+// (each H step uses only the newest batch) is the noisiest, and works well early on; dropping it
+// later lets H average over more cells.
 pub struct Minibatch {
     // Order of the cells; consecutive runs of `batch_size` form the minibatches.
     pub perm: Vec<u32>,
     pub batch_size: usize,
-    // λ, the minimum weight of the newest batch in H's running average
-    pub step: f32,
+    // λ, the minimum weight of the newest batch in H's running average, as a schedule of
+    // (first epoch, λ), sorted by epoch and starting at epoch 0
+    pub step: Vec<(usize, f32)>,
     // multiplicative updates of a batch's rows of W per visit
     pub w_steps: usize,
-    // full passes updating only W after the last epoch, so every row of W is fit to the final H
+    // full passes updating only W after the last epoch (if any), so every row of W is fit to the
+    // final H
     pub final_w_passes: usize,
     // seeds the order the batches are visited in each epoch
     pub seed: u64,
@@ -159,6 +164,8 @@ pub fn nmf(
     let mut minibatch = opts.minibatch.as_ref().map(|mb| {
         assert!(opts.fit_h && !opts.extrapolate);
         assert_eq!(mb.perm.len(), m);
+        assert!(mb.step.first().is_some_and(|&(e, _)| e == 0));
+        assert!(mb.step.is_sorted_by_key(|&(e, _)| e));
         (MinibatchState::new(x, n, k, mb), mb)
     });
     let full_h = opts.fit_h && minibatch.is_none();
@@ -224,7 +231,7 @@ pub fn nmf(
 
         let mut l_fused = None;
         if let Some((state, mb)) = &mut minibatch {
-            state.epoch(x, &mut w, &mut ht, mb, opts, isa);
+            state.epoch(iter, x, &mut w, &mut ht, mb, opts, isa);
         } else {
             if let Some(w_prev) = &mut w_prev {
                 extrapolate(&mut w, w_prev, β);
@@ -248,12 +255,18 @@ pub fn nmf(
             prev_loss = l;
 
             // With extrapolation the objective isn't monotone, so an increase doesn't count as
-            // having converged.
-            let improvement = (best_loss - l) / l.abs().max(f64::MIN_POSITIVE);
-            if (0.0..opts.tol).contains(&improvement) {
-                break;
+            // having converged. Minibatch training only counts from the last change of λ, before
+            // which the objective follows the schedule.
+            let final_phase = minibatch
+                .as_ref()
+                .is_none_or(|(_, mb)| iter >= mb.step.last().unwrap().0);
+            if final_phase {
+                let improvement = (best_loss - l) / l.abs().max(f64::MIN_POSITIVE);
+                if (0.0..opts.tol).contains(&improvement) {
+                    break;
+                }
+                best_loss = best_loss.min(l);
             }
-            best_loss = best_loss.min(l);
         }
 
         if opts
@@ -264,7 +277,7 @@ pub fn nmf(
         }
     }
 
-    if let Some((_, mb)) = &minibatch {
+    if let Some((_, mb)) = minibatch.as_ref().filter(|_| n_iter > 0) {
         for _ in 0..mb.final_w_passes {
             update_w(x, None, &mut w, &ht, false, opts.eps, isa);
         }
@@ -706,7 +719,8 @@ struct MinibatchState {
     ρht: Array2<f32>,                         // [n, k] accumulator, all zeros between steps
     a_ht: Array2<f32>,                        // [n, k] running average A
     b: Array1<f32>,                           // [k] running average B
-    t: usize,                                 // steps taken
+    t: usize,                                 // steps taken since λ last changed
+    λ: f32,                                   // the current λ
     rng: u64,
 }
 
@@ -729,13 +743,16 @@ impl MinibatchState {
             a_ht: Array2::zeros((n, k)),
             b: Array1::zeros(k),
             t: 0,
+            λ: f32::NAN,
             rng: mb.seed,
         }
     }
 
     // One pass over all minibatches, in a random order.
+    #[allow(clippy::too_many_arguments)]
     fn epoch(
         &mut self,
+        epoch: usize,
         x: &CSR,
         w: &mut Array2<f32>,  // [m, k]
         ht: &mut Array2<f32>, // [n, k]
@@ -744,6 +761,11 @@ impl MinibatchState {
         isa: Isa,
     ) {
         let m = w.nrows();
+        let λ_epoch = mb.step.iter().rfind(|&&(e, _)| e <= epoch).unwrap().1;
+        if λ_epoch != self.λ {
+            self.λ = λ_epoch;
+            self.t = 0;
+        }
         let mut order: Vec<usize> = (0..self.batches.len()).collect();
         // Fisher-Yates
         for i in (1..order.len()).rev() {
@@ -768,7 +790,7 @@ impl MinibatchState {
 
             accumulate_h(csc, &mut self.ρht, &w_b, ht, isa);
             self.t += 1;
-            let λ = mb.step.max(1.0 / self.t as f32);
+            let λ = self.λ.max(1.0 / self.t as f32);
             let scale = λ * m as f32 / rows.len() as f32;
             Zip::from(&mut self.b)
                 .and(&w_b.sum_axis(Axis(0)))
@@ -954,7 +976,7 @@ mod tests {
         let one_batch = |perm: Vec<u32>| Minibatch {
             perm,
             batch_size: m,
-            step: 1.0,
+            step: vec![(0, 1.0)],
             w_steps: 1,
             final_w_passes: 0,
             seed: 0,
@@ -978,7 +1000,7 @@ mod tests {
         let batched = run(Some(Minibatch {
             perm: shuffled,
             batch_size: 30,
-            step: 0.3,
+            step: vec![(0, 1.0), (4, 0.3)],
             w_steps: 2,
             final_w_passes: 3,
             seed: 1,

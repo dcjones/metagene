@@ -44,8 +44,9 @@ def test_given_init_is_deterministic():
     rng = np.random.default_rng(2)
     W0 = rng.random((300, 4)).astype(np.float32)
     H0 = rng.random((4, 100)).astype(np.float32)
-    a = metagene.nmf(X, 4, max_iter=20, W0=W0, H0=H0, n_threads=1)
-    b = metagene.nmf(X, 4, max_iter=20, W0=W0, H0=H0, n_threads=1)
+    # minibatches are drawn from the seed
+    a = metagene.nmf(X, 4, max_iter=20, W0=W0, H0=H0, seed=0, n_threads=1)
+    b = metagene.nmf(X, 4, max_iter=20, W0=W0, H0=H0, seed=0, n_threads=1)
     np.testing.assert_array_equal(a.W, b.W)
     np.testing.assert_array_equal(a.H, b.H)
 
@@ -161,11 +162,30 @@ def test_minibatch(batch_w_steps):
     assert losses[-1] == pytest.approx(kl(X, res.W, res.H) + np.sum(b * H - a * np.log(H)), rel=1e-4)
 
 
-def test_default_prior_is_gene_rate():
+def test_minibatch_step_schedule():
     X = random_counts()
-    res = metagene.nmf(X, 4, max_iter=50, tol=-np.inf, eval_every=10, seed=1)
-    explicit = metagene.nmf(X, 4, max_iter=50, tol=-np.inf, eval_every=10, seed=1, h_pseudocount=1.0,
-                            h_prior="gene-rate")
+    kw = dict(method="minibatch", batch_size=32, max_iter=60, eval_every=1, seed=1)
+    # A loose tol stops right away with a constant step, but not before the schedule's last step.
+    assert metagene.nmf(X, 4, batch_step=0.2, tol=0.5, **kw).n_iter <= 3
+    res = metagene.nmf(X, 4, batch_step=[(0, 1.0), (20, 0.2)], tol=0.5, **kw)
+    assert 20 < res.n_iter < 25
+    res = metagene.nmf(X, 4, batch_step=[(0, 1.0), (20, 0.2)], tol=-np.inf, **kw)
+    losses = [l for _, _, l in res.loss]
+    assert np.all(np.isfinite(losses)) and losses[-1] < 0.9 * losses[0]
+    with pytest.raises(ValueError):
+        metagene.nmf(X, 4, batch_step=[(1, 1.0), (20, 0.2)], **kw)
+
+
+def test_default_prior():
+    X = random_counts()
+    kw = dict(max_iter=50, tol=-np.inf, eval_every=10, seed=1)
+    # No prior by default: the objective is plain KL.
+    plain = metagene.nmf(X, 4, **kw)
+    np.testing.assert_array_equal(plain.H, metagene.nmf(X, 4, h_pseudocount=0, **kw).H)
+    assert plain.loss[-1][2] == pytest.approx(kl(X, plain.W, plain.H), rel=1e-4)
+    # Given a pseudocount, the prior is gene-rate.
+    res = metagene.nmf(X, 4, h_pseudocount=1.0, **kw)
+    explicit = metagene.nmf(X, 4, h_pseudocount=1.0, h_prior="gene-rate", **kw)
     np.testing.assert_array_equal(res.H, explicit.H)
     # The reported objective is KL plus the gene-rate prior's penalty, with the default rate.
     H0 = metagene.nmf(X, 4, max_iter=0, eval_every=0, seed=1).H.astype(np.float64)
@@ -174,7 +194,6 @@ def test_default_prior_is_gene_rate():
     H = res.H.astype(np.float64)
     penalty = np.sum(b * H - np.log(H))
     assert res.loss[-1][2] == pytest.approx(kl(X, res.W, res.H) + penalty, rel=1e-4)
-    plain = metagene.nmf(X, 4, max_iter=50, tol=-np.inf, eval_every=0, seed=1, h_pseudocount=0)
     assert not np.allclose(res.H, plain.H)
 
 
@@ -262,11 +281,18 @@ def test_warm_start(init):
     assert res.loss[0][2] < cold.loss[0][2]
 
 
-def test_warm_start_auto():
+def test_warm_start_auto(monkeypatch):
     X = random_counts()
-    auto = metagene.nmf(X, 4, max_iter=5, seed=0, n_threads=1)
-    cold = metagene.nmf(X, 4, max_iter=5, seed=0, n_threads=1, warm_start=False)
-    np.testing.assert_array_equal(auto.W, cold.W)
+    for method in ("minibatch", "bmme"):
+        auto = metagene.nmf(X, 4, method=method, max_iter=5, seed=0, n_threads=1)
+        cold = metagene.nmf(X, 4, method=method, max_iter=5, seed=0, n_threads=1, warm_start=False)
+        np.testing.assert_array_equal(auto.W, cold.W)
+    # Above the threshold, only the full-batch methods warm start by default.
+    monkeypatch.setattr(metagene, "WARM_START_MIN_CELLS", 10)
+    for method, warm in (("minibatch", False), ("bmme", True)):
+        auto = metagene.nmf(X, 4, method=method, max_iter=5, seed=0, n_threads=1)
+        cold = metagene.nmf(X, 4, method=method, max_iter=5, seed=0, n_threads=1, warm_start=False)
+        assert np.array_equal(auto.W, cold.W) != warm
     with pytest.raises(ValueError):
         metagene.nmf(X, 4, warm_start=True, warm_start_fraction=0.001, max_iter=5, seed=0)
 

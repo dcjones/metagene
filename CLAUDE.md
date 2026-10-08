@@ -37,9 +37,9 @@ Don't add scanpy/anndata as dependencies (too heavy); the `bench` extra is h5py,
 ## Algorithm and design decisions
 
 Each iteration is a W pass then an H pass (alternating multiplicative updates), or an epoch of
-minibatches with `method="minibatch"`. Defaults:
-`method="bmme"`, warm start auto-enabled for large m, gene-rate Gamma prior on H with
-`h_pseudocount=1`. All of the below were measured; see git log.
+minibatches with `method="minibatch"`. Defaults: `method="minibatch"` (step schedule 1.0 → 0.1 at
+epoch 150), no prior on H (`h_pseudocount=0`), NNDSVD init; the full-batch methods (`"bmme"`,
+`"mu"`) auto-enable the warm start for large m. All of the below were measured; see git log.
 
 - **W pass is row-parallel over CSR; H pass is column-parallel over a CSC copy.** Each thread owns
   the rows it writes. The original design fused both updates in one row-parallel pass, scattering
@@ -60,8 +60,8 @@ minibatches with `method="minibatch"`. Defaults:
   `(iteration, seconds, objective)` describing the state *before* that iteration's step; the
   objective is KL plus H's prior penalty (`h_penalty`, a cheap n×k pass).
 - **Warm start** (Python side): fit 10% of cells for 200 iterations, then 5 W-only passes
-  (`fit_H=False`) over all cells, then the full fit. Auto-enabled when no init is given and the
-  subsample would have ≥ 20k cells. 2–4× faster to a given objective on 250k and 660k cells; useless
+  (`fit_H=False`) over all cells, then the full fit. Auto-enabled for the full-batch methods when
+  no init is given and the subsample would have ≥ 20k cells (not used by minibatch training). 2–4× faster to a given objective on 250k and 660k cells; useless
   on ~10k cells. Tuned on 250k cells and checked at 660k: smaller subsamples (or a fixed cap) were
   worse.
 - **Initialization** (Python side): NNDSVD by default (`init="nndsvd"`), of the warm start's
@@ -94,8 +94,9 @@ minibatches with `method="minibatch"`. Defaults:
   data-scale-relative) floor is deliberate, since inputs are assumed to be transcript counts.
   (This sweep measured training objective only; see the prior below for held-out fit.)
 - **Gamma prior on H** (MAP; `h_pseudocount` a, `h_prior`): h_kj ~ Gamma(a + 1, b_j), so H's
-  update becomes (h ρh + a) / (Σw + b_j) — an exact MM step, monotone under MU. The default
-  "gene-rate" prior uses b_j = b / f_j with f_j = (c_j + 1) / mean(c + 1) from gene totals, so its
+  update becomes (h ρh + a) / (Σw + b_j) — an exact MM step, monotone under MU. Off by default
+  since minibatch training became the default (see below); it was the default before that. The
+  default `h_prior`, "gene-rate", uses b_j = b / f_j with f_j = (c_j + 1) / mean(c + 1) from gene totals, so its
   mode ∝ gene frequency (the rank-1 null's profile) and every gene gets the same pseudocount. b is
   only a gauge (W H is invariant to rescaling): b = a / mean(H0) keeps H at its initial scale.
   Why: held-out deviance (`benchmarks/heldout.py`: binomial split p = 0.5, fit one half, Poisson
@@ -113,7 +114,7 @@ minibatches with `method="minibatch"`. Defaults:
   convergence. It acts like ARD: at 9.5k scRNA cells, k=100, ~69 effective factors remain (88 with
   no prior); unneeded factors collapse onto the null profile, so k is an upper bound. a = 1 to 3
   were all good; a = 10 too strong.
-- **Minibatch training** (`method="minibatch"`, experimental): stochastic MM (Mairal 2013). Cells
+- **Minibatch training** (`method="minibatch"`, the default): stochastic MM (Mairal 2013). Cells
   are permuted once (in Rust, via a permutation from Python — X isn't copied), each batch gets its
   own CSC copy with batch-local row indices, and batches are visited in a random order each epoch:
   gather the batch's W rows, `batch_w_steps` MU steps, then H steps on running averages A [n, k] of
@@ -126,6 +127,20 @@ minibatches with `method="minibatch"`. Defaults:
   100 epochs → 0.230/0.181, 15, 8. λ = 0.5–1 regularizes more but loses held-out fit (0.177/0.167);
   λ = 0.02 approaches full batch. Cost: ~1.6 ms per batch of n×k passes on 18k genes, so 0.92 s
   per epoch at batch 1000 vs 0.52 s/iteration BMMe on 250k Atera cells (0.58 s at batch 5000).
+  Robustness metrics outside this repo favored minibatch with no prior on H, with minor
+  regressions on some spatial datasets; best overall was a decaying step, fairly insensitive to the
+  schedule. So `batch_step` is a schedule of (first epoch, λ), default 1.0 then 0.1 from epoch 150;
+  the 1/t averaging restarts when λ changes, and `tol` only applies in the last phase (λ = 1's
+  objective is noisy). In-solver schedule ≈ two separate calls (150 epochs at 1.0, refit at 0.1)
+  on every metric. scRNA, k=100, a=0, 200 epochs, 2 seeds (< 20 eff. cells, top-1% share > 0.5,
+  train/test): λ 0.1 → 9–10, 6–7, 0.265/0.142; λ 1 → 2, 3–4, 0.21–0.24/0.08–0.11; schedule → 3,
+  3–4, 0.260/0.136. Atera (first 50k cells) has no such outlier factors (none with < 100 eff.
+  cells, even for BMMe); train/test there: BMMe + gene-rate prior 0.182/0.149, λ 0.1 0.186/0.141,
+  λ 1 0.172/0.118, schedule 0.188/0.137 (held-out deviance favors the prior, as on scRNA).
+  Made the default with no prior on H on that evidence, despite the lower held-out deviance:
+  binomial splits share cells between train and test, so they can't see per-cell overfitting.
+  `heldout.py`'s `base` variant stays BMMe (`method=` selects others) to keep old results
+  comparable.
 
 ### Tried and rejected (don't redo without new evidence)
 

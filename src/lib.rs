@@ -153,7 +153,7 @@ mod metagene {
     /// prior penalty, if any. Given `batch_perm` (a permutation of the m rows), trains with
     /// minibatches of `batch_size` consecutive rows of it instead (see `Minibatch`).
     #[pyfunction]
-    #[pyo3(signature = (data, indices, indptr, w, ht, max_iter, tol, eval_every, verbose, n_threads=None, max_time=None, extrapolate=false, restart=false, fit_h=true, eps=1e-6, h_shape=None, h_rate=None, batch_perm=None, batch_size=1000, batch_step=0.1, batch_w_steps=1, batch_final_w_passes=0, batch_seed=0))]
+    #[pyo3(signature = (data, indices, indptr, w, ht, max_iter, tol, eval_every, verbose, n_threads=None, max_time=None, extrapolate=false, restart=false, fit_h=true, eps=1e-6, h_shape=None, h_rate=None, batch_perm=None, batch_size=1000, batch_step=vec![(0, 0.1)], batch_w_steps=1, batch_final_w_passes=0, batch_seed=0))]
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn _nmf<'py>(
         py: Python<'py>,
@@ -176,7 +176,7 @@ mod metagene {
         h_rate: Option<PyReadonlyArray1<'py, f32>>,
         batch_perm: Option<PyReadonlyArray1<'py, u32>>,
         batch_size: usize,
-        batch_step: f32,
+        batch_step: Vec<(usize, f32)>,
         batch_w_steps: usize,
         batch_final_w_passes: usize,
         batch_seed: u64,
@@ -239,9 +239,13 @@ mod metagene {
                         ));
                     }
                 }
-                if perm.len() != m || batch_size == 0 || !(batch_step > 0.0 && batch_step <= 1.0) {
+                let valid_steps = batch_step.first().is_some_and(|&(e, _)| e == 0)
+                    && batch_step.is_sorted_by_key(|&(e, _)| e)
+                    && batch_step.iter().all(|&(_, λ)| λ > 0.0 && λ <= 1.0);
+                if perm.len() != m || batch_size == 0 || !valid_steps {
                     return Err(PyValueError::new_err(
-                        "need batch_perm of length m, batch_size > 0, 0 < batch_step <= 1",
+                        "need batch_perm of length m, batch_size > 0, and batch_step a list of \
+                         (epoch, step) sorted by epoch, from epoch 0, with 0 < step <= 1",
                     ));
                 }
                 if extrapolate || !fit_h {
