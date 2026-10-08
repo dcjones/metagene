@@ -40,8 +40,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from datasets import load  # noqa: E402
 
 # Each method is called as f(X, k, W0, H0, max_iter, max_time, n_threads, eval_every, seed) and returns
-# a metagene.NMFResult whose loss records are (iteration, elapsed seconds, kl). Any work a method
-# does before calling metagene.nmf (e.g. fitting a subsample) must be included in those times.
+# a metagene.NMFResult whose loss records are (iteration, elapsed seconds, objective). The objective
+# (still called "kl" here) includes H's prior penalty, which is on by default, so traces recorded
+# before the prior became the default aren't comparable with new ones. Any work a method does
+# before calling metagene.nmf (e.g. fitting a subsample) must be included in those times.
 # Methods that set `init` compute their own initialization (seeded by the run's seed) and ignore
 # the shared W0, H0.
 def _metagene(**kw):

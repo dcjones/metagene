@@ -45,6 +45,13 @@ pub struct NMFOptions {
     // Update H. If false, H is held fixed and only W is fit.
     pub fit_h: bool,
 
+    // Floor applied to factor values after each multiplicative update.
+    pub eps: f32,
+
+    // Optional Gamma(a_j + 1, b_j) prior on each entry h_jk of H, as per-gene (a [n], b [n]): the
+    // objective gains Σ_jk b_j h_jk - a_j ln h_jk, and a_j acts as a pseudocount in H's update.
+    pub h_prior: Option<(Array1<f32>, Array1<f32>)>,
+
     pub verbose: bool,
 }
 
@@ -58,6 +65,8 @@ impl Default for NMFOptions {
             extrapolate: true,
             restart: false,
             fit_h: true,
+            eps: EPS,
+            h_prior: None,
             verbose: false,
         }
     }
@@ -132,10 +141,19 @@ pub fn nmf(
     let mut best_loss = f64::INFINITY;
     let mut n_iter = 0;
 
+    if let Some((a, b)) = &opts.h_prior {
+        assert_eq!(a.len(), n);
+        assert_eq!(b.len(), n);
+    }
+    let penalty = |ht: &Array2<f32>| match &opts.h_prior {
+        Some((a, b)) if opts.fit_h => h_penalty(ht.view(), a.view(), b.view()),
+        _ => 0.0,
+    };
+
     let mut record = |iter: usize, t: f64, l: f64| {
         loss.push((iter, t, l));
         if opts.verbose {
-            eprintln!("iter {iter} ({t:.2}s): kl = {l:.6e}");
+            eprintln!("iter {iter} ({t:.2}s): objective = {l:.6e}");
         }
     };
 
@@ -156,25 +174,30 @@ pub fn nmf(
         let eval = opts.eval_every > 0 && iter % opts.eval_every == 0;
         let fused_eval = eval && β == 0.0;
         let mut l = None;
-        if eval && !fused_eval {
+        if eval {
+            // H isn't changed until after the W pass, so its penalty can be taken here.
             let t0 = Instant::now();
-            l = Some(kl_divergence(x, w.view(), ht.view(), isa));
+            let mut l_eval = penalty(&ht);
+            if !fused_eval {
+                l_eval += kl_divergence(x, w.view(), ht.view(), isa);
+            }
+            l = Some(l_eval);
             eval_time += t0.elapsed();
         }
 
         if let Some(w_prev) = &mut w_prev {
             extrapolate(&mut w, w_prev, β);
         }
-        let l_fused = update_w(x, &mut w, &ht, fused_eval, isa);
+        let l_fused = update_w(x, &mut w, &ht, fused_eval, opts.eps, isa);
         if opts.fit_h {
             if let Some(ht_prev) = &mut ht_prev {
                 extrapolate(&mut ht, ht_prev, β);
             }
-            update_h(csc.as_ref().unwrap(), &mut ρht, &w, &mut ht, isa);
+            update_h(csc.as_ref().unwrap(), &mut ρht, &w, &mut ht, opts, isa);
         }
         n_iter = iter + 1;
 
-        if let Some(l) = l.or(l_fused) {
+        if let Some(l) = l.map(|l| l + l_fused.unwrap_or(0.0)) {
             record(iter, t_iter, l);
 
             if opts.restart && l > prev_loss {
@@ -202,7 +225,7 @@ pub fn nmf(
     if opts.eval_every > 0 {
         let t = elapsed(eval_time);
         let t0 = Instant::now();
-        let l = kl_divergence(x, w.view(), ht.view(), isa);
+        let l = kl_divergence(x, w.view(), ht.view(), isa) + penalty(&ht);
         eval_time += t0.elapsed();
         record(n_iter, t, l);
     }
@@ -334,7 +357,26 @@ impl BlockedCSC {
     }
 }
 
+// Default floor on factor values (NMFOptions::eps).
 const EPS: f32 = 1e-6;
+
+// Negative log density of H's Gamma prior, up to a constant: Σ_jk b_j h_jk - a_j ln h_jk.
+fn h_penalty(ht: ArrayView2<f32>, a: ArrayView1<f32>, b: ArrayView1<f32>) -> f64 {
+    let k = ht.ncols();
+    ht.as_slice()
+        .expect("ht must be contiguous")
+        .par_chunks(k)
+        .zip(a.as_slice().unwrap())
+        .zip(b.as_slice().unwrap())
+        .with_min_len(64)
+        .map(|((h_j, &a_j), &b_j)| {
+            let (a_j, b_j) = (a_j as f64, b_j as f64);
+            h_j.iter()
+                .map(|&h| b_j * h as f64 - a_j * (h as f64).ln())
+                .sum::<f64>()
+        })
+        .sum()
+}
 
 // Add row j's contributions from one block of cells, whose nonzeros are at `range`, to ρh_j.
 #[inline(always)]
@@ -395,8 +437,9 @@ fn mu_step(
     compute_loss: bool,
 ) -> Option<f64> {
     let isa = Isa::detect();
-    let l = update_w(x, w, ht, compute_loss, isa);
-    update_h(csc, ρht, w, ht, isa);
+    let opts = NMFOptions::default();
+    let l = update_w(x, w, ht, compute_loss, opts.eps, isa);
+    update_h(csc, ρht, w, ht, &opts, isa);
     l
 }
 
@@ -408,6 +451,7 @@ fn update_w(
     w: &mut Array2<f32>, // [m, k]
     ht: &Array2<f32>,    // [n, k]
     compute_loss: bool,
+    eps: f32,
     isa: Isa,
 ) -> Option<f64> {
     let k = w.ncols();
@@ -432,7 +476,17 @@ fn update_w(
                 let range = indptr[i] as usize..indptr[i + 1] as usize;
                 dispatch!(
                     isa,
-                    update_w_row(w_i, ρw_i, ht, h_col_sum, data, indices, range, compute_loss)
+                    update_w_row(
+                        w_i,
+                        ρw_i,
+                        ht,
+                        h_col_sum,
+                        data,
+                        indices,
+                        range,
+                        compute_loss,
+                        eps
+                    )
                 )
             },
         )
@@ -455,6 +509,7 @@ fn update_w_row<const AVX2: bool>(
     indices: &[u32],
     range: Range<usize>,
     compute_loss: bool,
+    eps: f32,
 ) -> f64 {
     let k = w_i.len();
     ρw_i.fill(0_f32);
@@ -501,20 +556,28 @@ fn update_w_row<const AVX2: bool>(
 
     // for each k
     for ((w_ik, ρw_ik), h_col_sum_k) in w_i.iter_mut().zip(&*ρw_i).zip(h_col_sum) {
-        *w_ik = (*w_ik * ρw_ik / h_col_sum_k).max(EPS);
+        *w_ik = (*w_ik * ρw_ik / h_col_sum_k).max(eps);
     }
 
     nz_loss_i
 }
 
-// Multiplicative update of H, column-parallel over CSC, one block of cells at a time.
+// Multiplicative update of H, column-parallel over CSC, one block of cells at a time. With a
+// Gamma(a_j + 1, b_j) prior (opts.h_prior) the majorizer's minimizer is
+// h_jk ← (h_jk ρh_jk + a_j) / (Σ_i w_ik + b_j).
 fn update_h(
     csc: &BlockedCSC,
     ρht: &mut Array2<f32>, // [n, k] accumulator, all zeros on entry and exit
     w: &Array2<f32>,       // [m, k]
     ht: &mut Array2<f32>,  // [n, k]
+    opts: &NMFOptions,
     isa: Isa,
 ) {
+    let eps = opts.eps;
+    let prior = opts
+        .h_prior
+        .as_ref()
+        .map(|(a, b)| (a.as_slice().unwrap(), b.as_slice().unwrap()));
     let k = w.ncols();
     let w_col_sum = w.sum_axis(Axis(0));
     let w_col_sum = w_col_sum.as_slice().unwrap();
@@ -540,10 +603,12 @@ fn update_h(
     ht.par_chunks_mut(k)
         .zip(ρht.par_chunks_mut(k))
         .with_max_len(PAR_GRAIN)
-        .for_each(|(h_j, ρh_j)| {
+        .enumerate()
+        .for_each(|(j, (h_j, ρh_j))| {
+            let (a_j, b_j) = prior.map_or((0.0, 0.0), |(a, b)| (a[j], b[j]));
             // for each k
             for ((h_jk, ρh_jk), w_col_sum_k) in h_j.iter_mut().zip(&*ρh_j).zip(w_col_sum) {
-                *h_jk = (*h_jk * ρh_jk / w_col_sum_k).max(EPS);
+                *h_jk = ((*h_jk * ρh_jk + a_j) / (w_col_sum_k + b_j)).max(eps);
             }
             ρh_j.fill(0_f32);
         });
@@ -599,6 +664,8 @@ mod tests {
             extrapolate: false,
             restart: false,
             fit_h: true,
+            eps: EPS,
+            h_prior: None,
             verbose: false,
         };
         let x = CSR {

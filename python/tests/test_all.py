@@ -29,7 +29,8 @@ def test_shapes_and_nonnegativity():
 
 def test_objective_decreases_and_matches_numpy():
     X = random_counts()
-    res = metagene.nmf(X, 4, method="mu", max_iter=100, tol=-np.inf, eval_every=1, seed=1)
+    res = metagene.nmf(X, 4, method="mu", max_iter=100, tol=-np.inf, eval_every=1, seed=1,
+                       h_pseudocount=0)
     losses = [l for _, _, l in res.loss]
     times = [t for _, t, _ in res.loss]
     assert all(b >= a for a, b in zip(times, times[1:]))
@@ -56,14 +57,15 @@ def test_accepts_other_formats():
         assert res.W.shape == (50, 3)
 
 
-def reference_mu(X, W, H, iters, eps=1e-6, fit_H=True):
-    """Dense float64 alternating KL multiplicative updates (W then H), clamping values at eps."""
+def reference_mu(X, W, H, iters, eps=1e-6, fit_H=True, a=0.0, b=0.0):
+    """Dense float64 alternating KL multiplicative updates (W then H), clamping values at eps, with
+    a Gamma(a + 1, b) prior on H (a and b scalars or per-gene [n] arrays)."""
     X = X.toarray().astype(np.float64)
     W, H = W.astype(np.float64), H.astype(np.float64)
     for _ in range(iters):
         W = np.maximum(W * ((X / (W @ H)) @ H.T) / H.sum(1), eps)
         if fit_H:
-            H = np.maximum(H * (W.T @ (X / (W @ H))) / W.sum(0)[:, None], eps)
+            H = np.maximum((H * (W.T @ (X / (W @ H))) + a) / (W.sum(0)[:, None] + b), eps)
     return W, H
 
 
@@ -72,10 +74,74 @@ def test_matches_reference_mu():
     rng = np.random.default_rng(3)
     W0 = rng.random((300, 4)).astype(np.float32)
     H0 = rng.random((4, 100)).astype(np.float32)
-    res = metagene.nmf(X, 4, method="mu", max_iter=30, tol=-np.inf, eval_every=0, W0=W0, H0=H0)
+    res = metagene.nmf(X, 4, method="mu", max_iter=30, tol=-np.inf, eval_every=0, W0=W0, H0=H0,
+                       h_pseudocount=0)
     Wr, Hr = reference_mu(X, W0, H0, 30)
     np.testing.assert_allclose(res.W, Wr, rtol=1e-3, atol=1e-5)
     np.testing.assert_allclose(res.H, Hr, rtol=1e-3, atol=1e-5)
+
+
+@pytest.mark.parametrize("eps", [1e-6, 1e-3])
+def test_h_prior_matches_reference_mu(eps):
+    X = random_counts()
+    rng = np.random.default_rng(3)
+    W0 = rng.random((300, 4)).astype(np.float32)
+    H0 = rng.random((4, 100)).astype(np.float32)
+    res = metagene.nmf(X, 4, method="mu", max_iter=30, tol=-np.inf, eval_every=0, W0=W0, H0=H0,
+                       h_pseudocount=0.5, h_rate=2.0, h_prior="flat", eps=eps)
+    Wr, Hr = reference_mu(X, W0, H0, 30, eps=eps, a=0.5, b=2.0)
+    np.testing.assert_allclose(res.W, Wr, rtol=1e-3, atol=1e-5)
+    np.testing.assert_allclose(res.H, Hr, rtol=1e-3, atol=1e-5)
+
+
+def test_gene_h_prior_matches_reference_mu():
+    X = random_counts()
+    rng = np.random.default_rng(3)
+    W0 = rng.random((300, 4)).astype(np.float32)
+    H0 = rng.random((4, 100)).astype(np.float32)
+    res = metagene.nmf(X, 4, method="mu", max_iter=30, tol=-np.inf, eval_every=0, W0=W0, H0=H0,
+                       h_pseudocount=0.5, h_rate=2.0, h_prior="gene-rate")
+    f = (X.toarray().sum(0) + 1.0) / (X.toarray().sum(0) + 1.0).mean()
+    Wr, Hr = reference_mu(X, W0, H0, 30, a=0.5, b=2.0 / f)
+    np.testing.assert_allclose(res.W, Wr, rtol=1e-3, atol=1e-5)
+    np.testing.assert_allclose(res.H, Hr, rtol=1e-3, atol=1e-5)
+
+
+@pytest.mark.parametrize("method", ["mu", "bmme"])
+def test_h_prior_objective(method):
+    X = random_counts()
+    a = 0.3
+    res = metagene.nmf(X, 4, method=method, max_iter=100, tol=-np.inf, eval_every=1, seed=1,
+                       h_pseudocount=a, h_prior="flat")
+    losses = [l for _, _, l in res.loss]
+    if method == "mu":
+        assert all(l1 <= l0 * (1 + 1e-6) for l0, l1 in zip(losses, losses[1:]))
+    # Default rate: H keeps its initial scale, a / b = mean(H0); the init is NNDSVD as for seed=1.
+    H0 = metagene.nmf(X, 4, max_iter=0, eval_every=0, seed=1).H
+    b = a / H0.astype(np.float64).mean()
+    H = res.H.astype(np.float64)
+    assert losses[-1] == pytest.approx(kl(X, res.W, res.H) + np.sum(b * H - a * np.log(H)), rel=1e-4)
+    # A stronger prior pulls H's small entries up.
+    plain = metagene.nmf(X, 4, method=method, max_iter=100, tol=-np.inf, eval_every=0, seed=1,
+                         h_pseudocount=0)
+    assert np.quantile(res.H, 0.1) > np.quantile(plain.H, 0.1)
+
+
+def test_default_prior_is_gene_rate():
+    X = random_counts()
+    res = metagene.nmf(X, 4, max_iter=50, tol=-np.inf, eval_every=10, seed=1)
+    explicit = metagene.nmf(X, 4, max_iter=50, tol=-np.inf, eval_every=10, seed=1, h_pseudocount=1.0,
+                            h_prior="gene-rate")
+    np.testing.assert_array_equal(res.H, explicit.H)
+    # The reported objective is KL plus the gene-rate prior's penalty, with the default rate.
+    H0 = metagene.nmf(X, 4, max_iter=0, eval_every=0, seed=1).H.astype(np.float64)
+    c = X.toarray().sum(0) + 1.0
+    b = (1.0 / H0.mean()) / (c / c.mean())
+    H = res.H.astype(np.float64)
+    penalty = np.sum(b * H - np.log(H))
+    assert res.loss[-1][2] == pytest.approx(kl(X, res.W, res.H) + penalty, rel=1e-4)
+    plain = metagene.nmf(X, 4, max_iter=50, tol=-np.inf, eval_every=0, seed=1, h_pseudocount=0)
+    assert not np.allclose(res.H, plain.H)
 
 
 def test_max_time():
@@ -109,7 +175,8 @@ def test_matches_reference_bmme():
     rng = np.random.default_rng(3)
     W0 = rng.random((300, 4)).astype(np.float32)
     H0 = rng.random((4, 100)).astype(np.float32)
-    res = metagene.nmf(X, 4, method="bmme", max_iter=30, tol=-np.inf, eval_every=0, W0=W0, H0=H0)
+    res = metagene.nmf(X, 4, method="bmme", max_iter=30, tol=-np.inf, eval_every=0, W0=W0, H0=H0,
+                       h_pseudocount=0)
     Wr, Hr = reference_bmme(X, W0, H0, 30)
     np.testing.assert_allclose(res.W, Wr, rtol=1e-3, atol=1e-5)
     np.testing.assert_allclose(res.H, Hr, rtol=1e-3, atol=1e-5)
@@ -119,7 +186,7 @@ def test_matches_reference_bmme():
 def test_bmme_loss_is_evaluated_at_iterates(restart):
     X = random_counts()
     res = metagene.nmf(X, 4, method="bmme", init="random", restart=restart, max_iter=50, tol=-np.inf,
-                       eval_every=1, seed=1)
+                       eval_every=1, seed=1, h_pseudocount=0)
     final = res.loss[-1][2]
     assert final == pytest.approx(kl(X, res.W, res.H), rel=1e-4)
     assert final < 0.5 * res.loss[0][2]
@@ -152,11 +219,12 @@ def test_fixed_H_without_W0():
 def test_warm_start(init):
     X = random_counts(m=600)
     res = metagene.nmf(X, 4, init=init, warm_start=True, warm_start_fraction=0.2, max_iter=50,
-                       tol=-np.inf, eval_every=1, seed=0)
+                       tol=-np.inf, eval_every=1, seed=0, h_pseudocount=0)
     assert res.init_time > 0
     assert res.loss[0][1] >= res.init_time
     assert res.loss[-1][2] == pytest.approx(kl(X, res.W, res.H), rel=1e-4)
-    cold = metagene.nmf(X, 4, init=init, warm_start=False, max_iter=50, tol=-np.inf, eval_every=1, seed=0)
+    cold = metagene.nmf(X, 4, init=init, warm_start=False, max_iter=50, tol=-np.inf, eval_every=1, seed=0,
+                        h_pseudocount=0)
     assert res.loss[0][2] < cold.loss[0][2]
 
 
@@ -201,11 +269,11 @@ def test_nndsvd_init():
     assert W0.shape == (300, 4) and H0.shape == (4, 100)
     assert (W0 >= metagene.EPS).all() and (H0 >= metagene.EPS).all()
     # a better starting point than the random init
-    a = metagene.nmf(X, 4, init="nndsvd", max_iter=1, tol=-np.inf, eval_every=1, seed=0)
-    b = metagene.nmf(X, 4, init="random", max_iter=1, tol=-np.inf, eval_every=1, seed=0)
+    a = metagene.nmf(X, 4, init="nndsvd", max_iter=1, tol=-np.inf, eval_every=1, seed=0, h_pseudocount=0)
+    b = metagene.nmf(X, 4, init="random", max_iter=1, tol=-np.inf, eval_every=1, seed=0, h_pseudocount=0)
     assert a.loss[0][2] < 0.5 * b.loss[0][2]
     # and reproducible given a seed
-    c = metagene.nmf(X, 4, init="nndsvd", max_iter=1, tol=-np.inf, eval_every=1, seed=0)
+    c = metagene.nmf(X, 4, init="nndsvd", max_iter=1, tol=-np.inf, eval_every=1, seed=0, h_pseudocount=0)
     np.testing.assert_array_equal(a.W, c.W)
     with pytest.raises(ValueError):
         metagene.nmf(X, 4, init="nndsvda")

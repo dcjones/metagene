@@ -149,9 +149,10 @@ mod metagene {
     ///
     /// Factorizes the [m, n] CSR matrix (data, indices, indptr) as X ≈ W Hᵀ, starting from
     /// `w` [m, k] and `ht` [n, k]. Returns (w, ht, loss, n_iter), where loss is a list of
-    /// (iteration, elapsed seconds, kl) tuples.
+    /// (iteration, elapsed seconds, objective) tuples; the objective is the KL divergence plus H's
+    /// prior penalty, if any.
     #[pyfunction]
-    #[pyo3(signature = (data, indices, indptr, w, ht, max_iter, tol, eval_every, verbose, n_threads=None, max_time=None, extrapolate=false, restart=false, fit_h=true))]
+    #[pyo3(signature = (data, indices, indptr, w, ht, max_iter, tol, eval_every, verbose, n_threads=None, max_time=None, extrapolate=false, restart=false, fit_h=true, eps=1e-6, h_shape=None, h_rate=None))]
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn _nmf<'py>(
         py: Python<'py>,
@@ -169,6 +170,9 @@ mod metagene {
         extrapolate: bool,
         restart: bool,
         fit_h: bool,
+        eps: f32,
+        h_shape: Option<PyReadonlyArray1<'py, f32>>,
+        h_rate: Option<PyReadonlyArray1<'py, f32>>,
     ) -> PyResult<(
         Bound<'py, PyArray2<f32>>,
         Bound<'py, PyArray2<f32>>,
@@ -200,6 +204,23 @@ mod metagene {
             return Err(PyValueError::new_err("column index out of bounds for ht"));
         }
 
+        let h_prior = match (h_shape, h_rate) {
+            (Some(a), Some(b)) => {
+                if a.len()? != n || b.len()? != n {
+                    return Err(PyValueError::new_err(
+                        "h_shape and h_rate must have length n",
+                    ));
+                }
+                Some((a.as_array().to_owned(), b.as_array().to_owned()))
+            }
+            (None, None) => None,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "h_shape and h_rate must be given together",
+                ));
+            }
+        };
+
         let opts = NMFOptions {
             max_iter,
             tol,
@@ -208,6 +229,8 @@ mod metagene {
             extrapolate,
             restart,
             fit_h,
+            eps,
+            h_prior,
             verbose,
         };
 

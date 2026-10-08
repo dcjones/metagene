@@ -16,7 +16,7 @@ __all__ = ["nmf", "NMFResult"]
 class NMFResult:
     W: np.ndarray  # [m, k]
     H: np.ndarray  # [k, n]
-    loss: list = field(default_factory=list)  # (iteration, elapsed seconds, kl) tuples
+    loss: list = field(default_factory=list)  # (iteration, elapsed seconds, objective) tuples
     n_iter: int = 0
     init_time: float = 0.0  # seconds spent on NNDSVD and the warm start, included in loss times
 
@@ -24,7 +24,7 @@ class NMFResult:
 # The warm start is enabled automatically when the subsample would have at least this many cells.
 WARM_START_MIN_CELLS = 20_000
 
-# The solver's floor on factor values (EPS in src/nmf.rs).
+# The solver's default floor on factor values (EPS in src/nmf.rs).
 EPS = 1e-6
 
 
@@ -70,7 +70,7 @@ def _randomized_svd(X, k, rng, n_oversamples=10, n_iter=4, n_threads=None):
     return U, S, (V @ E.astype(np.float32)).T
 
 
-def _nndsvd(X, k, rng, n_threads=None):
+def _nndsvd(X, k, rng, n_threads=None, eps=EPS):
     """NNDSVD initialization (Boutsidis & Gallopoulos 2008), with zeros raised to the solver's floor.
 
     Each singular triplet's sign is chosen so its positive (or negative) parts carry the most mass,
@@ -89,17 +89,18 @@ def _nndsvd(X, k, rng, n_threads=None):
     u = np.where(pos, Up / np.maximum(upn, 1e-30), Un / np.maximum(unn, 1e-30))
     v = np.where(pos, Vp / np.maximum(vpn, 1e-30), Vn / np.maximum(vnn, 1e-30))
     scale = np.sqrt(S * np.where(pos, upn * vpn, unn * vnn))
-    W = np.maximum(u * scale, EPS).astype(np.float32)
-    H = np.maximum(v * scale, EPS).astype(np.float32).T
+    W = np.maximum(u * scale, eps).astype(np.float32)
+    H = np.maximum(v * scale, eps).astype(np.float32).T
     return W, H
 
 
-def _fit(X, w, ht, *, max_iter, tol, eval_every, verbose, n_threads, max_time, method, restart, fit_H):
+def _fit(X, w, ht, *, max_iter, tol, eval_every, verbose, n_threads, max_time, method, restart, fit_H,
+         eps, h_shape, h_rate):
     """Run the Rust solver on a canonical CSR matrix. Returns (w, ht, loss, n_iter)."""
     data = np.ascontiguousarray(X.data, dtype=np.float32)
     return _nmf(
         data, _as_u32(X.indices), _as_u32(X.indptr), w, ht, max_iter, tol, eval_every, verbose,
-        n_threads, max_time, method == "bmme", restart, fit_H,
+        n_threads, max_time, method == "bmme", restart, fit_H, eps, h_shape, h_rate,
     )
 
 
@@ -111,6 +112,10 @@ def nmf(
     init: str = "nndsvd",
     restart: bool = False,
     fit_H: bool = True,
+    h_pseudocount: float = 1.0,
+    h_rate: float | None = None,
+    h_prior: str = "gene-rate",
+    eps: float = EPS,
     warm_start: bool | None = None,
     warm_start_fraction: float = 0.1,
     warm_start_iter: int = 200,
@@ -155,6 +160,24 @@ def nmf(
     fit_H : bool
         If False, H is held fixed at H0 (which must be given) and only W is fit, e.g. to project
         new cells onto existing factors.
+    h_pseudocount, h_rate, h_prior
+        A Gamma(a_j + 1, b_j) prior on each entry h_kj of H, fit by MAP: each update of h_kj
+        becomes (h_kj Σ_i w_ik x_ij / (W H)_ij + a_j) / (Σ_i w_ik + b_j), and the reported
+        objective adds Σ_kj b_j h_kj - a_j log h_kj. Without it, fits overfit the noise when there
+        are few cells per gene: rarely seen genes get near-zero loadings, which predict near-zero
+        means for counts not seen in training. By default every gene gets h_pseudocount = 1
+        pseudocount per factor (a_j = h_pseudocount), and with h_prior="gene-rate" the rate is
+        b_j = h_rate / f_j, where f_j = (c_j + 1) / mean(c + 1) is gene j's frequency from its total
+        count c_j in X. The prior's mode is then proportional to gene frequency, so loadings the
+        data doesn't support shrink towards the rank-1 (depth × frequency) model, and factors the
+        data doesn't support at all collapse onto it, making k an upper bound. With
+        h_prior="flat", b_j = h_rate for all genes, so the mode is a flat gene profile; this
+        over-predicts rare genes and prunes many more factors. Since W H is unchanged by rescaling
+        W and H in opposite directions, h_rate only sets the scale of H; by default it's
+        h_pseudocount / mean(H0), keeping H at its initial scale. The strength is set by
+        h_pseudocount (0 disables the prior and gives plain KL-NMF).
+    eps : float
+        Floor on factor values, applied after each update.
     warm_start : bool, optional
         Initialize by fitting a random subsample of cells (warm_start_iter iterations on a
         warm_start_fraction of the rows), then fitting W for all cells with that H held fixed
@@ -219,16 +242,31 @@ def nmf(
         H0 = scale * rng.random((k, n), dtype=np.float32)
     elif W0 is None and warm_start:
         W0 = flat_W()
-        W0[idx], H0 = _nndsvd(X_sub, k, rng, n_threads)
+        W0[idx], H0 = _nndsvd(X_sub, k, rng, n_threads, eps)
     elif W0 is None:
-        W0, H0 = _nndsvd(X, k, rng, n_threads)
+        W0, H0 = _nndsvd(X, k, rng, n_threads, eps)
     W0, H0 = np.asarray(W0), np.asarray(H0)
     if W0.shape != (m, k) or H0.shape != (k, n):
         raise ValueError(f"expected W0 {(m, k)} and H0 {(k, n)}, got {W0.shape} and {H0.shape}")
 
     w = np.array(W0, dtype=np.float32, order="C")
     ht = np.ascontiguousarray(H0.T, dtype=np.float32)
-    opts = dict(verbose=verbose, n_threads=n_threads, method=method, restart=restart)
+    if h_pseudocount < 0 or (h_rate is not None and h_rate < 0):
+        raise ValueError("h_pseudocount and h_rate must be non-negative")
+    if h_rate is None:
+        h_rate = h_pseudocount / max(float(ht.mean(dtype=np.float64)), eps)
+    h_shape = h_rate_j = None
+    if h_pseudocount > 0 or h_rate > 0:
+        h_shape, h_rate_j = np.full(n, h_pseudocount), np.full(n, h_rate)
+        if h_prior != "flat":
+            c = np.bincount(X.indices, weights=X.data, minlength=n) + 1.0
+            f = c / c.mean()
+            if h_prior != "gene-rate":
+                raise ValueError(f"unknown h_prior {h_prior!r}")
+            h_rate_j /= f
+        h_shape, h_rate_j = h_shape.astype(np.float32), h_rate_j.astype(np.float32)
+    opts = dict(verbose=verbose, n_threads=n_threads, method=method, restart=restart, eps=eps,
+                h_shape=h_shape, h_rate=h_rate_j)
 
     if warm_start:
         w_sub, ht, _, _ = _fit(

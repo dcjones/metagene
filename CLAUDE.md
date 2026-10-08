@@ -6,8 +6,8 @@ Fast KL-divergence NMF (X ≈ W H) for large, sparse single-cell / spatial count
 
 ## Layout
 
-- `src/nmf.rs` — the solver: `nmf()` main loop, W and H update passes, KL objective, BMMe
-  extrapolation, CSR/CSC structures. Tests at the bottom.
+- `src/nmf.rs` — the solver: `nmf()` main loop, W and H update passes, KL objective and H's prior
+  penalty, BMMe extrapolation, CSR/CSC structures. Tests at the bottom.
 - `src/kernels.rs` — inner-loop kernels (`dot`, `axpy`, fused `dot_n`/`axpy_n`, `prefetch`) in
   portable and AVX2+FMA versions, `Isa` runtime detection, and the `dispatch!` macro.
 - `src/spmm.rs` — sparse × dense products X B (row-parallel CSR) and Xᵀ B (blocked CSC), for the
@@ -15,10 +15,12 @@ Fast KL-divergence NMF (X ≈ W H) for large, sparse single-cell / spatial count
 - `src/lib.rs` — the `_nmf` Python binding (GIL released, optional rayon pool via `n_threads`), and
   `_SparseMatrix` (holds the blocked CSC copy across the SVD's products).
 - `python/metagene/__init__.py` — `metagene.nmf()`: input conversion (any scipy sparse/dense →
-  canonical CSR f32/u32 without copying where possible), initialization, warm start.
+  canonical CSR f32/u32 without copying where possible), initialization, warm start, the prior's
+  per-gene shape and rate.
 - `python/tests/test_all.py` — tests against dense numpy reference implementations of MU and BMMe.
-- `benchmarks/convergence.py` — convergence harness (objective vs. time/iteration); `datasets.py`
-  loads 10x `.h5` and AnnData `.zarr` without scanpy/anndata.
+- `benchmarks/convergence.py` — convergence harness (objective vs. time/iteration); `heldout.py` —
+  held-out deviance harness (binomial count split, solver variants); `datasets.py` loads 10x `.h5`
+  and AnnData `.zarr` without scanpy/anndata.
 
 ## Build and test
 
@@ -35,7 +37,8 @@ Don't add scanpy/anndata as dependencies (too heavy); the `bench` extra is h5py,
 ## Algorithm and design decisions
 
 Each iteration is a W pass then an H pass (alternating multiplicative updates). Defaults:
-`method="bmme"`, warm start auto-enabled for large m. All of the below were measured; see git log.
+`method="bmme"`, warm start auto-enabled for large m, gene-rate Gamma prior on H with
+`h_pseudocount=1`. All of the below were measured; see git log.
 
 - **W pass is row-parallel over CSR; H pass is column-parallel over a CSC copy.** Each thread owns
   the rows it writes. The original design fused both updates in one row-parallel pass, scattering
@@ -53,7 +56,8 @@ Each iteration is a W pass then an H pass (alternating multiplicative updates). 
   but no increases were ever observed; `restart` exists but never triggered.
 - **Objective:** computed for free in the W pass when no extrapolation is applied; otherwise a
   separate `kl_divergence` pass, excluded from reported timings. Loss records are
-  `(iteration, seconds, kl)` describing the state *before* that iteration's step.
+  `(iteration, seconds, objective)` describing the state *before* that iteration's step; the
+  objective is KL plus H's prior penalty (`h_penalty`, a cheap n×k pass).
 - **Warm start** (Python side): fit 10% of cells for 200 iterations, then 5 W-only passes
   (`fit_H=False`) over all cells, then the full fit. Auto-enabled when no init is given and the
   subsample would have ≥ 20k cells. 2–4× faster to a given objective on 250k and 660k cells; useless
@@ -87,6 +91,27 @@ Each iteration is a W pass then an H pass (alternating multiplicative updates). 
   ~300 iterations because floored entries take longer to recover (2–7e-4 worse at 1e-12). Most
   entries sit at the floor (~80% of W, ~67% of H) regardless of EPS. The absolute (not
   data-scale-relative) floor is deliberate, since inputs are assumed to be transcript counts.
+  (This sweep measured training objective only; see the prior below for held-out fit.)
+- **Gamma prior on H** (MAP; `h_pseudocount` a, `h_prior`): h_kj ~ Gamma(a + 1, b_j), so H's
+  update becomes (h ρh + a) / (Σw + b_j) — an exact MM step, monotone under MU. The default
+  "gene-rate" prior uses b_j = b / f_j with f_j = (c_j + 1) / mean(c + 1) from gene totals, so its
+  mode ∝ gene frequency (the rank-1 null's profile) and every gene gets the same pseudocount. b is
+  only a gauge (W H is invariant to rescaling): b = a / mean(H0) keeps H at its initial scale.
+  Why: held-out deviance (`benchmarks/heldout.py`: binomial split p = 0.5, fit one half, Poisson
+  deviance of the other, as explained deviance vs. the rank-1 null) showed plain KL-NMF overfits
+  when there are few cells per gene. At k=100 it was worse than the null at ≤ 2500 cells (−1.46 at
+  500 scRNA cells), and test fit fell with more iterations even at 9.5k cells (k=100 peaks at ~25
+  iterations) and at 250k Atera cells (0.143 → 0.139 from 200 to 800 iterations). Cause: most
+  factor entries sit at the floor, so rare genes get μ ≈ 0 where held-out counts land (at 500
+  cells, k=100, 59% of test nonzeros had μ < 1e-4). Measured on scRNA 9.5k cells and Atera
+  subsampled to 9503 cells (depth-matched and full depth), at 500/2500/9503 cells × k = 25/100/200:
+  gene-rate a = 1 was the best or near-best everywhere except Atera 9503 cells at k ≥ 100, where
+  it trailed the flat prior by ≤ 0.01. Test explained deviance at k=100, 9503 cells, base → gr=1:
+  scRNA 0.125 → 0.181, Atera depth-matched 0.041 → 0.109, full depth 0.103 → 0.138; at 250k Atera
+  cells 0.139 → 0.148, better in every gene-count bin, with no change in time per iteration or
+  convergence. It acts like ARD: at 9.5k scRNA cells, k=100, ~69 effective factors remain (88 with
+  no prior); unneeded factors collapse onto the null profile, so k is an upper bound. a = 1 to 3
+  were all good; a = 10 too strong.
 
 ### Tried and rejected (don't redo without new evidence)
 
@@ -96,6 +121,14 @@ L2-sized H blocks; more `dot_n` accumulators; software pipelining; prefetching w
 L2; prefetch off. Remaining cost is mostly L3 latency of gathered factor rows — roughly 2.5× the
 arithmetic throughput floor, which we consider near the practical floor for this design.
 
+Regularization alternatives, measured with `heldout.py` as above: raising EPS (1e-3 to 1e-2
+helps but less than the prior, and over-predicts rare genes: μ ≥ k·eps² everywhere; 1e-1 is
+catastrophic); a flat Gamma prior (`h_prior="flat"`, same mode for all genes; a ≈ 0.3–1 is close
+on topline numbers but makes genes with < 10 counts much worse than the null and prunes to ~17
+effective factors of 100 at 9.5k cells); pseudocounts ∝ gene frequency ("gene-shape", removed:
+over-shrinks highly expressed genes). Not tried: a_j ∝ f_j^γ interpolating gene-rate (γ = 0) and
+gene-shape (γ = 1), which might recover gene-rate's small loss on highly expressed genes in Atera.
+
 ## Benchmarking
 
 - Convergence: `benchmarks/convergence.py run DATA --k 100 --seeds 0 1 2 --methods mu bmme bmme-warm
@@ -104,6 +137,12 @@ arithmetic throughput floor, which we consider near the practical floor for this
   to the best reference; without one, runs measured against their own end plunge to 0 (an artifact).
   Runs can land in different local minima (~1e-3 apart on scRNA), so keep several references
   (`ref-*`) and use several seeds. `benchmarks/results/` is gitignored.
+- Held-out fit: `benchmarks/heldout.py run DATA --ncells 500 2500 9503 --k 25 100 200 --variants
+  base gr=1 a=1 eps=1e-3 --out benchmarks/results/<name>` then `report <out> --plot`. Variants are
+  comma-separated settings (`base` is plain KL-NMF; `gr=`/`a=` are gene-rate/flat pseudocounts,
+  `eps=`); `--subsample N`/`--thin F` make a smaller/shallower version of a dataset (Atera was
+  compared to scRNA with `--subsample 9503 --thin 0.646`). Fits are rerun per `--iters` value from
+  the same init. Report test explained deviance; per-gene-count bins show where a variant helps.
 - Per-iteration speed: time an N-iteration run minus a 1-iteration run (excludes setup like the CSC
   build); `perf stat` instructions/cycles per nonzero per pass are steadier than wall time, but
   summed cycles include rayon threads spin-waiting.
