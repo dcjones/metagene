@@ -6,7 +6,7 @@ mod spmm;
 
 #[pymodule]
 mod metagene {
-    use crate::nmf::{BlockedCSC, CSR, H_PASS_BLOCK_BYTES, NMFOptions, nmf};
+    use crate::nmf::{BlockedCSC, CSR, H_PASS_BLOCK_BYTES, Minibatch, NMFOptions, nmf};
     use crate::spmm::{csc_matmul, csr_matmul};
     use numpy::{
         IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
@@ -150,9 +150,10 @@ mod metagene {
     /// Factorizes the [m, n] CSR matrix (data, indices, indptr) as X ≈ W Hᵀ, starting from
     /// `w` [m, k] and `ht` [n, k]. Returns (w, ht, loss, n_iter), where loss is a list of
     /// (iteration, elapsed seconds, objective) tuples; the objective is the KL divergence plus H's
-    /// prior penalty, if any.
+    /// prior penalty, if any. Given `batch_perm` (a permutation of the m rows), trains with
+    /// minibatches of `batch_size` consecutive rows of it instead (see `Minibatch`).
     #[pyfunction]
-    #[pyo3(signature = (data, indices, indptr, w, ht, max_iter, tol, eval_every, verbose, n_threads=None, max_time=None, extrapolate=false, restart=false, fit_h=true, eps=1e-6, h_shape=None, h_rate=None))]
+    #[pyo3(signature = (data, indices, indptr, w, ht, max_iter, tol, eval_every, verbose, n_threads=None, max_time=None, extrapolate=false, restart=false, fit_h=true, eps=1e-6, h_shape=None, h_rate=None, batch_perm=None, batch_size=1000, batch_step=0.1, batch_w_steps=1, batch_final_w_passes=0, batch_seed=0))]
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn _nmf<'py>(
         py: Python<'py>,
@@ -173,6 +174,12 @@ mod metagene {
         eps: f32,
         h_shape: Option<PyReadonlyArray1<'py, f32>>,
         h_rate: Option<PyReadonlyArray1<'py, f32>>,
+        batch_perm: Option<PyReadonlyArray1<'py, u32>>,
+        batch_size: usize,
+        batch_step: f32,
+        batch_w_steps: usize,
+        batch_final_w_passes: usize,
+        batch_seed: u64,
     ) -> PyResult<(
         Bound<'py, PyArray2<f32>>,
         Bound<'py, PyArray2<f32>>,
@@ -221,6 +228,39 @@ mod metagene {
             }
         };
 
+        let minibatch = match batch_perm {
+            Some(perm) => {
+                let perm = perm.as_array().to_vec();
+                let mut seen = vec![false; m];
+                for &i in &perm {
+                    if (i as usize) >= m || std::mem::replace(&mut seen[i as usize], true) {
+                        return Err(PyValueError::new_err(
+                            "batch_perm must be a permutation of m",
+                        ));
+                    }
+                }
+                if perm.len() != m || batch_size == 0 || !(batch_step > 0.0 && batch_step <= 1.0) {
+                    return Err(PyValueError::new_err(
+                        "need batch_perm of length m, batch_size > 0, 0 < batch_step <= 1",
+                    ));
+                }
+                if extrapolate || !fit_h {
+                    return Err(PyValueError::new_err(
+                        "minibatch training requires extrapolate=False and fit_h=True",
+                    ));
+                }
+                Some(Minibatch {
+                    perm,
+                    batch_size,
+                    step: batch_step,
+                    w_steps: batch_w_steps,
+                    final_w_passes: batch_final_w_passes,
+                    seed: batch_seed,
+                })
+            }
+            None => None,
+        };
+
         let opts = NMFOptions {
             max_iter,
             tol,
@@ -231,6 +271,7 @@ mod metagene {
             fit_h,
             eps,
             h_prior,
+            minibatch,
             verbose,
         };
 

@@ -127,6 +127,40 @@ def test_h_prior_objective(method):
     assert np.quantile(res.H, 0.1) > np.quantile(plain.H, 0.1)
 
 
+def test_minibatch_single_batch_matches_reference_mu():
+    # One batch with step 1 is the full-batch update, whatever order the cells are in.
+    X = random_counts()
+    rng = np.random.default_rng(3)
+    W0 = rng.random((300, 4)).astype(np.float32)
+    H0 = rng.random((4, 100)).astype(np.float32)
+    res = metagene.nmf(X, 4, method="minibatch", batch_size=300, batch_step=1.0,
+                       batch_final_w_passes=0, max_iter=30, tol=-np.inf, eval_every=0, W0=W0,
+                       H0=H0, h_pseudocount=0.5, h_rate=2.0, h_prior="flat", seed=4)
+    Wr, Hr = reference_mu(X, W0, H0, 30, a=0.5, b=2.0)
+    np.testing.assert_allclose(res.W, Wr, rtol=1e-3, atol=1e-5)
+    np.testing.assert_allclose(res.H, Hr, rtol=1e-3, atol=1e-5)
+
+
+@pytest.mark.parametrize("batch_w_steps", [1, 3])
+def test_minibatch(batch_w_steps):
+    X = random_counts()
+    a = 0.5
+    res = metagene.nmf(X, 4, method="minibatch", batch_size=32, batch_step=0.2,
+                       batch_w_steps=batch_w_steps, max_iter=100, tol=-np.inf, eval_every=1, seed=1,
+                       h_pseudocount=a, h_prior="flat")
+    full = metagene.nmf(X, 4, method="mu", max_iter=100, tol=-np.inf, eval_every=1, seed=1,
+                        h_pseudocount=a, h_prior="flat")
+    losses = [l for _, _, l in res.loss]
+    assert len(losses) == 101 and np.all(np.isfinite(losses))
+    assert losses[-1] < 0.9 * losses[0]
+    assert losses[-1] < 1.05 * full.loss[-1][2]
+    # The last record is of the returned factors, after the final W passes.
+    H0 = metagene.nmf(X, 4, max_iter=0, eval_every=0, seed=1).H
+    b = a / H0.astype(np.float64).mean()
+    H = res.H.astype(np.float64)
+    assert losses[-1] == pytest.approx(kl(X, res.W, res.H) + np.sum(b * H - a * np.log(H)), rel=1e-4)
+
+
 def test_default_prior_is_gene_rate():
     X = random_counts()
     res = metagene.nmf(X, 4, max_iter=50, tol=-np.inf, eval_every=10, seed=1)

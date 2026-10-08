@@ -1,5 +1,5 @@
 use crate::kernels::{Isa, axpy, axpy_n, dispatch, dot, dot_n, prefetch};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip};
 use rayon::prelude::*;
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -52,7 +52,36 @@ pub struct NMFOptions {
     // objective gains Σ_jk b_j h_jk - a_j ln h_jk, and a_j acts as a pseudocount in H's update.
     pub h_prior: Option<(Array1<f32>, Array1<f32>)>,
 
+    // Train with minibatches of cells (stochastic MM) instead of full passes. Requires
+    // `extrapolate = false` and `fit_h`.
+    pub minibatch: Option<Minibatch>,
+
     pub verbose: bool,
+}
+
+// Minibatch training (stochastic majorization-minimization; Mairal 2013, SIAM J. Optim. 25:829).
+// Each iteration is one epoch: the minibatches are visited in a random order, and for each, its rows
+// of W get `w_steps` multiplicative updates, then H takes a step on a running average of its
+// majorizer. H's majorizer at H̃ is Σ_jk b_j h_jk - (h̃_jk ρh_jk + a_j) ln h_jk + h_jk Σ_i w_ik, so
+// the average only needs A [n, k] (of h̃_jk ρh_jk) and B [k] (of Σ_i w_ik), each scaled by m / |batch|
+// to estimate the full-data sum. With weight λ_t = max(λ, 1 / t) on step t's batch,
+//
+//     A ← (1 - λ_t) A + λ_t m/|b| h̃ ρh_b,   B ← (1 - λ_t) B + λ_t m/|b| Σ_{i∈b} w_i,
+//     h_jk ← (A_jk + a_j) / (B_k + b_j).
+//
+// A single batch with λ = 1 is the full-batch update. Smaller λ averages over more batches.
+pub struct Minibatch {
+    // Order of the cells; consecutive runs of `batch_size` form the minibatches.
+    pub perm: Vec<u32>,
+    pub batch_size: usize,
+    // λ, the minimum weight of the newest batch in H's running average
+    pub step: f32,
+    // multiplicative updates of a batch's rows of W per visit
+    pub w_steps: usize,
+    // full passes updating only W after the last epoch, so every row of W is fit to the final H
+    pub final_w_passes: usize,
+    // seeds the order the batches are visited in each epoch
+    pub seed: u64,
 }
 
 impl Default for NMFOptions {
@@ -67,6 +96,7 @@ impl Default for NMFOptions {
             fit_h: true,
             eps: EPS,
             h_prior: None,
+            minibatch: None,
             verbose: false,
         }
     }
@@ -126,10 +156,17 @@ pub fn nmf(
     let mut eval_time = Duration::ZERO;
     let elapsed = |eval_time: Duration| (start.elapsed() - eval_time).as_secs_f64();
 
+    let mut minibatch = opts.minibatch.as_ref().map(|mb| {
+        assert!(opts.fit_h && !opts.extrapolate);
+        assert_eq!(mb.perm.len(), m);
+        (MinibatchState::new(x, n, k, mb), mb)
+    });
+    let full_h = opts.fit_h && minibatch.is_none();
+
     let block_rows = (H_PASS_BLOCK_BYTES / (k * size_of::<f32>())).max(1);
-    // only needed to update H
-    let csc = opts.fit_h.then(|| BlockedCSC::from_csr(x, n, block_rows));
-    let mut ρht = Array2::<f32>::zeros((if opts.fit_h { n } else { 0 }, k));
+    // only needed to update H in full passes
+    let csc = full_h.then(|| BlockedCSC::from_csr(x, n, block_rows));
+    let mut ρht = Array2::<f32>::zeros((if full_h { n } else { 0 }, k));
 
     // previous iterates, for extrapolation
     let mut w_prev = opts.extrapolate.then(|| w.clone());
@@ -172,7 +209,7 @@ pub fn nmf(
         // The objective of the state before the step. This can be computed nearly for free in the
         // W pass, unless W is extrapolated first.
         let eval = opts.eval_every > 0 && iter % opts.eval_every == 0;
-        let fused_eval = eval && β == 0.0;
+        let fused_eval = eval && β == 0.0 && minibatch.is_none();
         let mut l = None;
         if eval {
             // H isn't changed until after the W pass, so its penalty can be taken here.
@@ -185,11 +222,16 @@ pub fn nmf(
             eval_time += t0.elapsed();
         }
 
-        if let Some(w_prev) = &mut w_prev {
-            extrapolate(&mut w, w_prev, β);
+        let mut l_fused = None;
+        if let Some((state, mb)) = &mut minibatch {
+            state.epoch(x, &mut w, &mut ht, mb, opts, isa);
+        } else {
+            if let Some(w_prev) = &mut w_prev {
+                extrapolate(&mut w, w_prev, β);
+            }
+            l_fused = update_w(x, None, &mut w, &ht, fused_eval, opts.eps, isa);
         }
-        let l_fused = update_w(x, &mut w, &ht, fused_eval, opts.eps, isa);
-        if opts.fit_h {
+        if full_h {
             if let Some(ht_prev) = &mut ht_prev {
                 extrapolate(&mut ht, ht_prev, β);
             }
@@ -219,6 +261,12 @@ pub fn nmf(
             .is_some_and(|max_time| elapsed(eval_time) >= max_time)
         {
             break;
+        }
+    }
+
+    if let Some((_, mb)) = &minibatch {
+        for _ in 0..mb.final_w_passes {
+            update_w(x, None, &mut w, &ht, false, opts.eps, isa);
         }
     }
 
@@ -299,7 +347,8 @@ fn col_sum_f64(a: ArrayView2<f32>) -> Array1<f64> {
         .reduce(|| Array1::<f64>::zeros(k), |a, b| a + b)
 }
 
-// Transposed (CSC) copy of a contiguous block of rows of X. Row indices are global.
+// Transposed (CSC) copy of some rows of X: CSR row `i` is stored under row index `r`, for each
+// (r, i) in `rows`.
 pub(crate) struct CSC {
     pub(crate) data: Vec<f32>,
     pub(crate) indices: Vec<u32>, // row (cell) indices
@@ -307,27 +356,28 @@ pub(crate) struct CSC {
 }
 
 impl CSC {
-    fn from_csr(x: &CSR, n: usize, rows: Range<usize>) -> Self {
-        let p_from = x.indptr[rows.start] as usize;
-        let p_to = x.indptr[rows.end] as usize;
-        let nnz = p_to - p_from;
+    fn from_csr(x: &CSR, n: usize, rows: impl Iterator<Item = (u32, usize)> + Clone) -> Self {
+        let range = |i: usize| x.indptr[i] as usize..x.indptr[i + 1] as usize;
 
         let mut csc_indptr = vec![0_usize; n + 1];
-        for &j in x.indices.slice(s![p_from..p_to]) {
-            csc_indptr[j as usize + 1] += 1;
+        for (_, i) in rows.clone() {
+            for p in range(i) {
+                csc_indptr[x.indices[p] as usize + 1] += 1;
+            }
         }
         for j in 0..n {
             csc_indptr[j + 1] += csc_indptr[j];
         }
+        let nnz = csc_indptr[n];
 
         let mut next = csc_indptr.clone();
         let mut csc_data = vec![0_f32; nnz];
         let mut csc_indices = vec![0_u32; nnz];
-        for i in rows {
-            for p in x.indptr[i] as usize..x.indptr[i + 1] as usize {
+        for (r, i) in rows {
+            for p in range(i) {
                 let j = x.indices[p] as usize;
                 csc_data[next[j]] = x.data[p];
-                csc_indices[next[j]] = i as u32;
+                csc_indices[next[j]] = r;
                 next[j] += 1;
             }
         }
@@ -347,11 +397,29 @@ pub(crate) struct BlockedCSC {
 }
 
 impl BlockedCSC {
+    // All of X, with global row indices.
     pub(crate) fn from_csr(x: &CSR, n: usize, block_rows: usize) -> Self {
         let m = x.indptr.len() - 1;
         let blocks = (0..m.div_ceil(block_rows).max(1))
             .into_par_iter()
-            .map(|b| CSC::from_csr(x, n, b * block_rows..((b + 1) * block_rows).min(m)))
+            .map(|b| {
+                let rows = b * block_rows..((b + 1) * block_rows).min(m);
+                CSC::from_csr(x, n, rows.map(|i| (i as u32, i)))
+            })
+            .collect();
+        Self { blocks }
+    }
+
+    // The CSR rows `rows` of X, with row indices into `rows`.
+    fn from_csr_rows(x: &CSR, n: usize, rows: &[u32], block_rows: usize) -> Self {
+        let blocks = rows
+            .chunks(block_rows)
+            .enumerate()
+            .map(|(b, chunk)| {
+                let offset = b * block_rows;
+                let rows = chunk.iter().enumerate();
+                CSC::from_csr(x, n, rows.map(|(r, &i)| ((offset + r) as u32, i as usize)))
+            })
             .collect();
         Self { blocks }
     }
@@ -438,17 +506,18 @@ fn mu_step(
 ) -> Option<f64> {
     let isa = Isa::detect();
     let opts = NMFOptions::default();
-    let l = update_w(x, w, ht, compute_loss, opts.eps, isa);
+    let l = update_w(x, None, w, ht, compute_loss, opts.eps, isa);
     update_h(csc, ρht, w, ht, &opts, isa);
     l
 }
 
-// Multiplicative update of W, row-parallel over CSR. If `compute_loss`, also returns the KL
-// divergence of the state prior to the update, which is nearly free since this pass already
-// computes u_ij at each nonzero.
+// Multiplicative update of W, row-parallel over CSR. Row i of `w` is CSR row `rows[i]` if given,
+// otherwise row i. If `compute_loss`, also returns the KL divergence of the state prior to the
+// update, which is nearly free since this pass already computes u_ij at each nonzero.
 fn update_w(
     x: &CSR,
-    w: &mut Array2<f32>, // [m, k]
+    rows: Option<&[u32]>,
+    w: &mut Array2<f32>, // [m, k], or [rows.len(), k]
     ht: &Array2<f32>,    // [n, k]
     compute_loss: bool,
     eps: f32,
@@ -473,6 +542,7 @@ fn update_w(
         .map_init(
             || vec![0_f32; k],
             |ρw_i, (i, w_i)| {
+                let i = rows.map_or(i, |rows| rows[i] as usize);
                 let range = indptr[i] as usize..indptr[i + 1] as usize;
                 dispatch!(
                     isa,
@@ -574,32 +644,14 @@ fn update_h(
     isa: Isa,
 ) {
     let eps = opts.eps;
-    let prior = opts
-        .h_prior
-        .as_ref()
-        .map(|(a, b)| (a.as_slice().unwrap(), b.as_slice().unwrap()));
+    let prior = h_prior_slices(opts);
     let k = w.ncols();
     let w_col_sum = w.sum_axis(Axis(0));
     let w_col_sum = w_col_sum.as_slice().unwrap();
-    let w = w.as_slice().expect("w must be contiguous");
+    accumulate_h(csc, ρht, w, ht, isa);
+
     let ht = ht.as_slice_mut().expect("ht must be contiguous");
     let ρht = ρht.as_slice_mut().expect("ρht must be contiguous");
-
-    for block in &csc.blocks {
-        let ht = &*ht;
-        ρht.par_chunks_mut(k)
-            .with_max_len(PAR_GRAIN)
-            .enumerate()
-            .for_each(|(j, ρh_j)| {
-                let h_j = &ht[j * k..(j + 1) * k];
-                let range = block.indptr[j]..block.indptr[j + 1];
-                dispatch!(
-                    isa,
-                    accumulate_h_row(ρh_j, h_j, w, &block.data, &block.indices, range)
-                );
-            });
-    }
-
     ht.par_chunks_mut(k)
         .zip(ρht.par_chunks_mut(k))
         .with_max_len(PAR_GRAIN)
@@ -612,6 +664,152 @@ fn update_h(
             }
             ρh_j.fill(0_f32);
         });
+}
+
+fn h_prior_slices(opts: &NMFOptions) -> Option<(&[f32], &[f32])> {
+    opts.h_prior
+        .as_ref()
+        .map(|(a, b)| (a.as_slice().unwrap(), b.as_slice().unwrap()))
+}
+
+// ρh_jk += Σ_i w_ik x_ij / (W Hᵀ)_ij over the nonzeros in `csc`, whose row indices index `w`.
+fn accumulate_h(
+    csc: &BlockedCSC,
+    ρht: &mut Array2<f32>, // [n, k]
+    w: &Array2<f32>,       // [m, k]
+    ht: &Array2<f32>,      // [n, k]
+    isa: Isa,
+) {
+    let k = w.ncols();
+    let w = w.as_slice().expect("w must be contiguous");
+    let ht = ht.as_slice().expect("ht must be contiguous");
+    let ρht = ρht.as_slice_mut().expect("ρht must be contiguous");
+
+    for block in &csc.blocks {
+        ρht.par_chunks_mut(k)
+            .with_max_len(PAR_GRAIN)
+            .enumerate()
+            .for_each(|(j, ρh_j)| {
+                let h_j = &ht[j * k..(j + 1) * k];
+                let range = block.indptr[j]..block.indptr[j + 1];
+                dispatch!(
+                    isa,
+                    accumulate_h_row(ρh_j, h_j, w, &block.data, &block.indices, range)
+                );
+            });
+    }
+}
+
+// State of minibatch training (see `Minibatch`).
+struct MinibatchState {
+    batches: Vec<(Range<usize>, BlockedCSC)>, // ranges of `perm`, and those rows' CSC copies
+    ρht: Array2<f32>,                         // [n, k] accumulator, all zeros between steps
+    a_ht: Array2<f32>,                        // [n, k] running average A
+    b: Array1<f32>,                           // [k] running average B
+    t: usize,                                 // steps taken
+    rng: u64,
+}
+
+impl MinibatchState {
+    fn new(x: &CSR, n: usize, k: usize, mb: &Minibatch) -> Self {
+        let m = mb.perm.len();
+        let batch_size = mb.batch_size.clamp(1, m.max(1));
+        let block_rows = (H_PASS_BLOCK_BYTES / (k * size_of::<f32>())).max(1);
+        let batches = (0..m.div_ceil(batch_size))
+            .into_par_iter()
+            .map(|b| {
+                let range = b * batch_size..((b + 1) * batch_size).min(m);
+                let csc = BlockedCSC::from_csr_rows(x, n, &mb.perm[range.clone()], block_rows);
+                (range, csc)
+            })
+            .collect();
+        Self {
+            batches,
+            ρht: Array2::zeros((n, k)),
+            a_ht: Array2::zeros((n, k)),
+            b: Array1::zeros(k),
+            t: 0,
+            rng: mb.seed,
+        }
+    }
+
+    // One pass over all minibatches, in a random order.
+    fn epoch(
+        &mut self,
+        x: &CSR,
+        w: &mut Array2<f32>,  // [m, k]
+        ht: &mut Array2<f32>, // [n, k]
+        mb: &Minibatch,
+        opts: &NMFOptions,
+        isa: Isa,
+    ) {
+        let m = w.nrows();
+        let mut order: Vec<usize> = (0..self.batches.len()).collect();
+        // Fisher-Yates
+        for i in (1..order.len()).rev() {
+            order.swap(i, (splitmix64(&mut self.rng) % (i as u64 + 1)) as usize);
+        }
+
+        for b in order {
+            let (range, csc) = &self.batches[b];
+            let rows = &mb.perm[range.clone()];
+            // the batch's rows of W, [|b|, k]
+            let mut w_b = Array2::zeros((rows.len(), w.ncols()));
+            // for each i in the batch
+            for (mut w_bi, &i) in w_b.outer_iter_mut().zip(rows) {
+                w_bi.assign(&w.row(i as usize));
+            }
+            for _ in 0..mb.w_steps {
+                update_w(x, Some(rows), &mut w_b, ht, false, opts.eps, isa);
+            }
+            for (w_bi, &i) in w_b.outer_iter().zip(rows) {
+                w.row_mut(i as usize).assign(&w_bi);
+            }
+
+            accumulate_h(csc, &mut self.ρht, &w_b, ht, isa);
+            self.t += 1;
+            let λ = mb.step.max(1.0 / self.t as f32);
+            let scale = λ * m as f32 / rows.len() as f32;
+            Zip::from(&mut self.b)
+                .and(&w_b.sum_axis(Axis(0)))
+                .for_each(|b_k, &s_k| *b_k = (1.0 - λ) * *b_k + scale * s_k);
+            self.step_h(ht, λ, scale, opts);
+        }
+    }
+
+    // A ← (1 - λ) A + scale h̃ ρh, then h ← (A + a) / (B + b).
+    fn step_h(&mut self, ht: &mut Array2<f32>, λ: f32, scale: f32, opts: &NMFOptions) {
+        let eps = opts.eps;
+        let prior = h_prior_slices(opts);
+        let k = ht.ncols();
+        let b = self.b.as_slice().unwrap();
+        ht.as_slice_mut()
+            .unwrap()
+            .par_chunks_mut(k)
+            .zip(self.ρht.as_slice_mut().unwrap().par_chunks_mut(k))
+            .zip(self.a_ht.as_slice_mut().unwrap().par_chunks_mut(k))
+            .with_max_len(PAR_GRAIN)
+            .enumerate()
+            .for_each(|(j, ((h_j, ρh_j), a_hj))| {
+                let (a_j, b_j) = prior.map_or((0.0, 0.0), |(a, b)| (a[j], b[j]));
+                // for each k
+                for (((h_jk, ρh_jk), a_hjk), b_k) in
+                    h_j.iter_mut().zip(&*ρh_j).zip(a_hj.iter_mut()).zip(b)
+                {
+                    *a_hjk = (1.0 - λ) * *a_hjk + scale * *h_jk * ρh_jk;
+                    *h_jk = ((*a_hjk + a_j) / (b_k + b_j)).max(eps);
+                }
+                ρh_j.fill(0_f32);
+            });
+    }
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e3779b97f4a7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
 }
 
 #[cfg(test)]
@@ -666,6 +864,7 @@ mod tests {
             fit_h: true,
             eps: EPS,
             h_prior: None,
+            minibatch: None,
             verbose: false,
         };
         let x = CSR {
@@ -721,5 +920,71 @@ mod tests {
         assert_eq!(w1, w2);
         assert_eq!(ht1, ht2);
         assert_eq!(l1, l2);
+    }
+
+    #[test]
+    fn minibatch_matches_full_batch() {
+        let (m, n, k) = (200, 80, 5);
+        let mut rng = Lcg(91011);
+        let (data, indices, indptr) = random_csr(&mut rng, m, n);
+        let x = CSR {
+            data: data.view(),
+            indices: indices.view(),
+            indptr: indptr.view(),
+        };
+        let w0 = Array2::from_shape_simple_fn((m, k), || 0.1 + rng.next_f32());
+        let ht0 = Array2::from_shape_simple_fn((n, k), || 0.1 + rng.next_f32());
+        let a = Array1::from_shape_fn(n, |j| 0.5 + j as f32 / n as f32);
+        let b = Array1::from_shape_fn(n, |j| 0.1 + 0.01 * j as f32);
+        // a fixed non-identity permutation
+        let shuffled: Vec<u32> = (0..m as u32).map(|i| (i * 37 + 11) % m as u32).collect();
+
+        let run = |minibatch: Option<Minibatch>| {
+            let opts = NMFOptions {
+                max_iter: 10,
+                tol: f64::NEG_INFINITY,
+                eval_every: 1,
+                extrapolate: false,
+                h_prior: Some((a.clone(), b.clone())),
+                minibatch,
+                ..Default::default()
+            };
+            nmf(&x, w0.clone(), ht0.clone(), &opts)
+        };
+        let one_batch = |perm: Vec<u32>| Minibatch {
+            perm,
+            batch_size: m,
+            step: 1.0,
+            w_steps: 1,
+            final_w_passes: 0,
+            seed: 0,
+        };
+
+        let full = run(None);
+        let identity = run(Some(one_batch((0..m as u32).collect())));
+        assert_eq!(full.w, identity.w);
+        assert_eq!(full.ht, identity.ht);
+
+        // the same, but with cells summed in a different order
+        let permuted = run(Some(one_batch(shuffled.clone())));
+        let close = |a: &Array2<f32>, b: &Array2<f32>| {
+            Zip::from(a)
+                .and(b)
+                .all(|&a, &b| (a - b).abs() <= 1e-4 * a.abs().max(b.abs()).max(1e-3))
+        };
+        assert!(close(&full.w, &permuted.w));
+        assert!(close(&full.ht, &permuted.ht));
+
+        let batched = run(Some(Minibatch {
+            perm: shuffled,
+            batch_size: 30,
+            step: 0.3,
+            w_steps: 2,
+            final_w_passes: 3,
+            seed: 1,
+        }));
+        let (first, last) = (batched.loss[0].2, batched.loss.last().unwrap().2);
+        assert!(last.is_finite() && last < 0.9 * first, "{first} -> {last}");
+        assert!(last < full.loss.last().unwrap().2 * 1.1);
     }
 }

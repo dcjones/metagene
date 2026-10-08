@@ -36,7 +36,8 @@ Don't add scanpy/anndata as dependencies (too heavy); the `bench` extra is h5py,
 
 ## Algorithm and design decisions
 
-Each iteration is a W pass then an H pass (alternating multiplicative updates). Defaults:
+Each iteration is a W pass then an H pass (alternating multiplicative updates), or an epoch of
+minibatches with `method="minibatch"`. Defaults:
 `method="bmme"`, warm start auto-enabled for large m, gene-rate Gamma prior on H with
 `h_pseudocount=1`. All of the below were measured; see git log.
 
@@ -112,6 +113,19 @@ Each iteration is a W pass then an H pass (alternating multiplicative updates). 
   convergence. It acts like ARD: at 9.5k scRNA cells, k=100, ~69 effective factors remain (88 with
   no prior); unneeded factors collapse onto the null profile, so k is an upper bound. a = 1 to 3
   were all good; a = 10 too strong.
+- **Minibatch training** (`method="minibatch"`, experimental): stochastic MM (Mairal 2013). Cells
+  are permuted once (in Rust, via a permutation from Python — X isn't copied), each batch gets its
+  own CSC copy with batch-local row indices, and batches are visited in a random order each epoch:
+  gather the batch's W rows, `batch_w_steps` MU steps, then H steps on running averages A [n, k] of
+  h̃ρh and B [k] of Σw (scaled by m/|b|, newest batch weight λ_t = max(`batch_step`, 1/t)), then
+  `batch_final_w_passes` full W passes. One batch with λ = 1 is bit-identical to MU (tested).
+  Motivation: on scRNA, full-batch fits dedicate factors to a long tail of very deep cells, which
+  held-out deviance (same cells) doesn't see; countdown's minibatch training avoids it. scRNA 9.5k
+  cells, k=100: BMMe 200 it. → train/test explained deviance 0.238/0.181, 25 factors with < 20
+  effective cells, 15 with > 50% of their mass in the top 1% deepest cells; minibatch (1000, 0.1)
+  100 epochs → 0.230/0.181, 15, 8. λ = 0.5–1 regularizes more but loses held-out fit (0.177/0.167);
+  λ = 0.02 approaches full batch. Cost: ~1.6 ms per batch of n×k passes on 18k genes, so 0.92 s
+  per epoch at batch 1000 vs 0.52 s/iteration BMMe on 250k Atera cells (0.58 s at batch 5000).
 
 ### Tried and rejected (don't redo without new evidence)
 

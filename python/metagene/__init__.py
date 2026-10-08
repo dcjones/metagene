@@ -95,12 +95,16 @@ def _nndsvd(X, k, rng, n_threads=None, eps=EPS):
 
 
 def _fit(X, w, ht, *, max_iter, tol, eval_every, verbose, n_threads, max_time, method, restart, fit_H,
-         eps, h_shape, h_rate):
-    """Run the Rust solver on a canonical CSR matrix. Returns (w, ht, loss, n_iter)."""
+         eps, h_shape, h_rate, batch=None):
+    """Run the Rust solver on a canonical CSR matrix. Returns (w, ht, loss, n_iter).
+
+    batch, for method="minibatch", is (perm, batch_size, batch_step, batch_w_steps,
+    batch_final_w_passes, seed)."""
     data = np.ascontiguousarray(X.data, dtype=np.float32)
     return _nmf(
         data, _as_u32(X.indices), _as_u32(X.indptr), w, ht, max_iter, tol, eval_every, verbose,
         n_threads, max_time, method == "bmme", restart, fit_H, eps, h_shape, h_rate,
+        *(batch or (None, 1000, 0.1, 1, 0, 0)),
     )
 
 
@@ -109,6 +113,10 @@ def nmf(
     k: int,
     *,
     method: str = "bmme",
+    batch_size: int = 1000,
+    batch_step: float = 0.1,
+    batch_w_steps: int = 1,
+    batch_final_w_passes: int = 5,
     init: str = "nndsvd",
     restart: bool = False,
     fit_H: bool = True,
@@ -143,11 +151,19 @@ def nmf(
         Count matrix, typically cells × genes. Converted to CSR float32.
     k : int
         Number of factors.
-    method : {"bmme", "mu"}
+    method : {"bmme", "mu", "minibatch"}
         Multiplicative updates with extrapolation (BMMe, the default), or plain multiplicative
         updates. BMMe costs the same per iteration and typically needs 2-4x fewer iterations to
         reach a given objective. Its objective isn't guaranteed to be monotone, and evaluating it
         costs an extra pass over the data (so about 1/eval_every extra W-pass work).
+        With "minibatch", each iteration is an epoch over minibatches of batch_size cells
+        (a random partition of the cells, visited in a random order each epoch): a batch's rows of
+        W get batch_w_steps multiplicative updates, then H takes a step on a running average of
+        its majorizer (stochastic MM, Mairal 2013), in which the newest batch has weight at least
+        batch_step. A smaller batch_step averages over more batches (about 1 / batch_step), and a
+        larger one makes H follow each batch more closely. The fit ends with
+        batch_final_w_passes W-only passes, so every cell's W is fit to the final H. The warm start
+        isn't used by default.
     init : {"nndsvd", "random"}
         How to initialize the factors when W0 and H0 aren't given: NNDSVD (Boutsidis & Gallopoulos
         2008, from a randomized truncated SVD of X, or of the warm start's subsample), or uniformly
@@ -203,7 +219,7 @@ def nmf(
     verbose : bool
         Print the objective to stderr whenever it's evaluated.
     """
-    if method not in ("mu", "bmme"):
+    if method not in ("mu", "bmme", "minibatch"):
         raise ValueError(f"unknown method {method!r}")
     if init not in ("nndsvd", "random"):
         raise ValueError(f"unknown init {init!r}")
@@ -216,7 +232,8 @@ def nmf(
 
     n_sub = int(warm_start_fraction * m)
     if warm_start is None:
-        warm_start = fit_H and W0 is None and H0 is None and n_sub >= WARM_START_MIN_CELLS
+        warm_start = (fit_H and W0 is None and H0 is None and n_sub >= WARM_START_MIN_CELLS
+                      and method != "minibatch")
     if warm_start and not fit_H:
         raise ValueError("warm_start requires fit_H=True")
     if warm_start and not (k <= n_sub < m):
@@ -284,9 +301,16 @@ def nmf(
     if max_time is not None:
         max_time = max(max_time - init_time, 0.0)
 
+    batch = None
+    if method == "minibatch" and fit_H:
+        if batch_size < 1 or not 0 < batch_step <= 1 or batch_w_steps < 0:
+            raise ValueError("need batch_size >= 1, 0 < batch_step <= 1, batch_w_steps >= 0")
+        perm = rng.permutation(m).astype(np.uint32)
+        batch = (perm, batch_size, batch_step, batch_w_steps, batch_final_w_passes,
+                 int(rng.integers(2**63)))
     w, ht, loss, n_iter = _fit(
         X, w, ht, max_iter=max_iter, tol=tol, eval_every=eval_every, max_time=max_time,
-        fit_H=fit_H, **opts,
+        fit_H=fit_H, batch=batch, **opts,
     )
     loss = [(i, t + init_time, l) for i, t, l in loss]
     return NMFResult(W=w, H=ht.T, loss=loss, n_iter=n_iter, init_time=init_time)
