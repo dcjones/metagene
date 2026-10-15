@@ -15,8 +15,8 @@ Fast KL-divergence NMF (X ≈ W H) for large, sparse single-cell / spatial count
 - `src/lib.rs` — the `_nmf` Python binding (GIL released, optional rayon pool via `n_threads`), and
   `_SparseMatrix` (holds the blocked CSC copy across the SVD's products).
 - `python/metagene/__init__.py` — `metagene.nmf()`: input conversion (any scipy sparse/dense →
-  canonical CSR f32/u32 without copying where possible), initialization, warm start, the prior's
-  per-gene shape and rate.
+  canonical CSR: f32 data, u32 indices, u64 indptr so nnz may exceed 2^32; no copies where
+  possible), initialization, warm start, the prior's per-gene shape and rate.
 - `python/tests/test_all.py` — tests against dense numpy reference implementations of MU and BMMe.
 - `benchmarks/convergence.py` — convergence harness (objective vs. time/iteration); `heldout.py` —
   held-out deviance harness (binomial count split, solver variants); `datasets.py` loads 10x `.h5`

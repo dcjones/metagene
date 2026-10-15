@@ -28,7 +28,7 @@ mod metagene {
     fn check_csr(
         data: &PyReadonlyArray1<f32>,
         indices: &PyReadonlyArray1<u32>,
-        indptr: &PyReadonlyArray1<u32>,
+        indptr: &PyReadonlyArray1<u64>,
         m: usize,
         n: usize,
     ) -> PyResult<()> {
@@ -53,7 +53,7 @@ mod metagene {
     struct _SparseMatrix {
         data: Py<PyArray1<f32>>,
         indices: Py<PyArray1<u32>>,
-        indptr: Py<PyArray1<u32>>,
+        indptr: Py<PyArray1<u64>>,
         m: usize,
         n: usize,
         csc: BlockedCSC,
@@ -78,7 +78,7 @@ mod metagene {
             py: Python,
             data: PyReadonlyArray1<f32>,
             indices: PyReadonlyArray1<u32>,
-            indptr: PyReadonlyArray1<u32>,
+            indptr: PyReadonlyArray1<u64>,
             n: usize,
             l: usize,
             n_threads: Option<usize>,
@@ -159,7 +159,7 @@ mod metagene {
         py: Python<'py>,
         data: PyReadonlyArray1<'py, f32>,
         indices: PyReadonlyArray1<'py, u32>,
-        indptr: PyReadonlyArray1<'py, u32>,
+        indptr: PyReadonlyArray1<'py, u64>,
         w: PyReadonlyArray2<'py, f32>,
         ht: PyReadonlyArray2<'py, f32>,
         max_iter: usize,

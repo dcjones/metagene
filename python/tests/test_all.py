@@ -58,6 +58,16 @@ def test_accepts_other_formats():
         assert res.W.shape == (50, 3)
 
 
+def test_int64_indices_match_int32():
+    # scipy switches to int64 indices past 2^31 nonzeros; indptr is passed to Rust as u64 either way.
+    X = random_counts()
+    X64 = X.copy()  # set directly: scipy's constructor would downcast them to int32
+    X64.indices, X64.indptr = X.indices.astype(np.int64), X.indptr.astype(np.int64)
+    a = metagene.nmf(X, 4, max_iter=20, seed=1)
+    b = metagene.nmf(X64, 4, max_iter=20, seed=1)
+    np.testing.assert_array_equal(a.W, b.W)
+    np.testing.assert_array_equal(a.H, b.H)
+
 def reference_mu(X, W, H, iters, eps=1e-6, fit_H=True, a=0.0, b=0.0):
     """Dense float64 alternating KL multiplicative updates (W then H), clamping values at eps, with
     a Gamma(a + 1, b) prior on H (a and b scalars or per-gene [n] arrays)."""
@@ -301,7 +311,7 @@ def test_warm_start_auto(monkeypatch):
 def test_sparse_matrix_products(n_threads):
     X = random_counts(m=200, n=70)
     rng = np.random.default_rng(0)
-    A = metagene._SparseMatrix(X.data, X.indices.view(np.uint32), X.indptr.view(np.uint32), 70, 13,
+    A = metagene._SparseMatrix(X.data, X.indices.view(np.uint32), X.indptr.astype(np.uint64), 70, 13,
                                n_threads)
     B = rng.standard_normal((70, 13), dtype=np.float32)
     C = rng.standard_normal((200, 13), dtype=np.float32)

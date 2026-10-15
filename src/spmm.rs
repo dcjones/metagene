@@ -104,9 +104,9 @@ mod tests {
     use ndarray::{Array1, Array2};
 
     // Small sparse test matrix in CSR form, with its dense equivalent.
-    fn test_matrix(m: usize, n: usize) -> (Array1<f32>, Array1<u32>, Array1<u32>, Array2<f32>) {
+    fn test_matrix(m: usize, n: usize) -> (Array1<f32>, Array1<u32>, Array1<u64>, Array2<f32>) {
         let mut dense = Array2::<f32>::zeros((m, n));
-        let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0_u32]);
+        let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0_u64]);
         for i in 0..m {
             for j in 0..n {
                 // a fixed, irregular sparsity pattern, including empty rows and columns
@@ -117,7 +117,7 @@ mod tests {
                     indices.push(j as u32);
                 }
             }
-            indptr.push(data.len() as u32);
+            indptr.push(data.len() as u64);
         }
         (data.into(), indices.into(), indptr.into(), dense)
     }

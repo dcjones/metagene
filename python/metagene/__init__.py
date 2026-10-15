@@ -43,8 +43,15 @@ def _as_u32(a: np.ndarray) -> np.ndarray:
     if a.dtype == np.int32 or a.dtype == np.uint32:
         return np.ascontiguousarray(a).view(np.uint32)
     if a.size and a.max() > np.iinfo(np.uint32).max:
-        raise ValueError("matrix has too many nonzeros for 32-bit indices")
+        raise ValueError("matrix dimensions too large for 32-bit indices")
     return a.astype(np.uint32)
+
+
+def _as_u64(a: np.ndarray) -> np.ndarray:
+    # indptr is 64-bit so the number of nonzeros isn't limited to 2^32; int64 is reinterpreted for free.
+    if a.dtype == np.int64 or a.dtype == np.uint64:
+        return np.ascontiguousarray(a).view(np.uint64)
+    return a.astype(np.uint64)
 
 
 def _randomized_svd(X, k, rng, n_oversamples=10, n_iter=4, n_threads=None):
@@ -58,7 +65,7 @@ def _randomized_svd(X, k, rng, n_oversamples=10, n_iter=4, n_threads=None):
     """
     l = min(k + n_oversamples, *X.shape)
     data = np.ascontiguousarray(X.data, dtype=np.float32)
-    A = _SparseMatrix(data, _as_u32(X.indices), _as_u32(X.indptr), X.shape[1], l, n_threads)
+    A = _SparseMatrix(data, _as_u32(X.indices), _as_u64(X.indptr), X.shape[1], l, n_threads)
     V = rng.standard_normal((X.shape[1], l), dtype=np.float32)  # [n, l]
     for _ in range(n_iter + 1):
         V, _ = np.linalg.qr(A.rmatmul(A.matmul(V)))
@@ -102,7 +109,7 @@ def _fit(X, w, ht, *, max_iter, tol, eval_every, verbose, n_threads, max_time, m
     batch_final_w_passes, seed)."""
     data = np.ascontiguousarray(X.data, dtype=np.float32)
     return _nmf(
-        data, _as_u32(X.indices), _as_u32(X.indptr), w, ht, max_iter, tol, eval_every, verbose,
+        data, _as_u32(X.indices), _as_u64(X.indptr), w, ht, max_iter, tol, eval_every, verbose,
         n_threads, max_time, method == "bmme", restart, fit_H, eps, h_shape, h_rate,
         *(batch or (None, 1000, [(0, 0.1)], 1, 0, 0)),
     )

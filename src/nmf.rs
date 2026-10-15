@@ -121,11 +121,11 @@ pub struct NMFResult {
 pub struct CSR<'a> {
     pub data: ArrayView1<'a, f32>,
     pub indices: ArrayView1<'a, u32>, // column (gene) indices
-    pub indptr: ArrayView1<'a, u32>,
+    pub indptr: ArrayView1<'a, u64>, // row offsets into data and indices
 }
 
 impl CSR<'_> {
-    pub(crate) fn slices(&self) -> (&[f32], &[u32], &[u32]) {
+    pub(crate) fn slices(&self) -> (&[f32], &[u32], &[u64]) {
         (
             self.data.as_slice().expect("data must be contiguous"),
             self.indices.as_slice().expect("indices must be contiguous"),
@@ -851,10 +851,10 @@ mod tests {
     }
 
     // Random sparse count matrix in CSR form, with varying per-gene sparsity.
-    fn random_csr(rng: &mut Lcg, m: usize, n: usize) -> (Array1<f32>, Array1<u32>, Array1<u32>) {
+    fn random_csr(rng: &mut Lcg, m: usize, n: usize) -> (Array1<f32>, Array1<u32>, Array1<u64>) {
         let mut data = Vec::new();
         let mut indices = Vec::new();
-        let mut indptr = vec![0_u32];
+        let mut indptr = vec![0_u64];
         for _ in 0..m {
             for j in 0..n {
                 let p = 0.05 + 0.6 * (j as f32 / n as f32);
@@ -863,7 +863,7 @@ mod tests {
                     indices.push(j as u32);
                 }
             }
-            indptr.push(data.len() as u32);
+            indptr.push(data.len() as u64);
         }
         (data.into(), indices.into(), indptr.into())
     }
