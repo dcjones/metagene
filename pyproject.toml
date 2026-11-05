@@ -16,6 +16,9 @@ dependencies = [
     "scipy",
 ]
 [project.optional-dependencies]
+anndata = [
+    "anndata",
+]
 tests = [
     "pytest",
 ]

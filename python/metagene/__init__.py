@@ -38,6 +38,12 @@ def _as_csr(X) -> sp.csr_matrix:
     return X
 
 
+def _is_anndata(X) -> bool:
+    # Checked without importing anndata: if it hasn't been imported, X can't be an AnnData.
+    ad = sys.modules.get("anndata")
+    return ad is not None and isinstance(X, ad.AnnData)
+
+
 def _as_u32(a: np.ndarray) -> np.ndarray:
     # scipy indices are int32/int64 and non-negative, so int32 can be reinterpreted for free.
     if a.dtype == np.int32 or a.dtype == np.uint32:
@@ -119,6 +125,7 @@ def nmf(
     X,
     k: int,
     *,
+    layer: str | None = None,
     method: str = "minibatch",
     batch_size: int = 1000,
     batch_step: float | list[tuple[int, float]] = ((0, 1.0), (150, 0.1)),
@@ -159,10 +166,14 @@ def nmf(
 
     Parameters
     ----------
-    X : scipy sparse matrix or array-like, shape [m, n]
-        Count matrix, typically cells × genes. Converted to CSR float32.
+    X : scipy sparse matrix, array-like, or AnnData, shape [m, n]
+        Count matrix, typically cells × genes. Converted to CSR float32. Given an AnnData object,
+        its X (or the given layer) is factorized, so it should hold raw counts, and the result is
+        also stored in it: W in adata.obsm["W_nmf"] ([m, k]) and Hᵀ in adata.varm["Ht_nmf"] ([n, k]).
     k : int
         Number of factors.
+    layer : str, optional
+        If X is an AnnData object, factorize adata.layers[layer] instead of adata.X.
     method : {"minibatch", "bmme", "mu"}
         With "minibatch" (the default), each iteration is an epoch over minibatches of batch_size
         cells (a random partition of the cells, visited in a random order each epoch): a batch's
@@ -245,6 +256,13 @@ def nmf(
         raise ValueError(f"unknown method {method!r}")
     if init not in ("nndsvd", "random"):
         raise ValueError(f"unknown init {init!r}")
+    adata = None
+    if _is_anndata(X):
+        adata, X = X, (X.X if layer is None else X.layers[layer])
+        if X is None:
+            raise ValueError("AnnData object has no X")
+    elif layer is not None:
+        raise ValueError("layer is only supported when X is an AnnData object")
     X = _as_csr(X)
     m, n = X.shape
 
@@ -339,4 +357,7 @@ def nmf(
         fit_H=fit_H, batch=batch, **opts,
     )
     loss = [(i, t + init_time, l) for i, t, l in loss]
+    if adata is not None:
+        adata.obsm["W_nmf"] = w
+        adata.varm["Ht_nmf"] = ht
     return NMFResult(W=w, H=ht.T, loss=loss, n_iter=n_iter, init_time=init_time)
